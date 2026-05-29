@@ -226,13 +226,13 @@ describe('createRouter', () => {
 		}
 	});
 
-	test('snapshot reports shard health + tenant count', () => {
+	test('snapshot reports shard health + per-tenant state', () => {
 		const router = createRouter({ shards: makeShards(2) });
 		router.acquire('a');
 		router.acquire('b');
 		router.markUnhealthy('s1');
 		const snap = router.snapshot();
-		expect(snap.tenants).toBe(2);
+		expect(snap.tenants).toHaveLength(2);
 		const byId = Object.fromEntries(snap.shards.map((shard) => [shard.id, shard]));
 		expect(byId.s0!.healthy).toBe(true);
 		expect(byId.s1!.healthy).toBe(false);
@@ -243,5 +243,162 @@ describe('createRouter', () => {
 		router.dispose();
 		expect(router.route({ tenantId: 't' }).decision).toBe('no-shards');
 		expect(router.shards()).toEqual([]);
+	});
+
+	// ───────── 0.1.0 surface ──────────────────────────────────────────────
+
+	test('drainShard excludes the shard from routing without marking it unhealthy', () => {
+		const router = createRouter({ shards: makeShards(3) });
+		// Find a tenant that pins to s1.
+		let pinned: string | undefined;
+		for (let i = 0; i < 200; i++) {
+			const tenant = `tenant-${i}`;
+			const result = router.route({ tenantId: tenant });
+			if (result.shard!.id === 's1') { pinned = tenant; break; }
+		}
+		expect(pinned).toBeDefined();
+
+		router.drainShard('s1');
+		expect(router.isDraining('s1')).toBe(true);
+		expect(router.isHealthy('s1')).toBe(true);
+
+		const after = router.route({ tenantId: pinned! });
+		expect(after.shard!.id).not.toBe('s1');
+
+		router.markHealthy('s1');
+		expect(router.isDraining('s1')).toBe(false);
+		const restored = router.route({ tenantId: pinned! });
+		expect(restored.shard!.id).toBe('s1');
+	});
+
+	test('load hook biases rendezvous toward less-loaded shards', () => {
+		// Shard B reports 10x the load of A; A should win ~10/11 of the time.
+		const router = createRouter({
+			hashStrategy: 'rendezvous',
+			load: (id) => (id === 'B' ? 10 : 1),
+			shards: [
+				{ id: 'A', url: 'ws://a' },
+				{ id: 'B', url: 'ws://b' },
+			],
+		});
+		const counts = { A: 0, B: 0 };
+		for (let i = 0; i < 2000; i++) {
+			const result = router.route({ tenantId: `t-${i}` });
+			counts[result.shard!.id as 'A' | 'B'] += 1;
+		}
+		// Expect A to clearly dominate. Be generous on bounds; rendezvous + 32-bit seed has variance.
+		expect(counts.A).toBeGreaterThan(counts.B * 5);
+	});
+
+	test('per-route rate limit gates independently of the tenant bucket', () => {
+		const clock = clockFrom();
+		const router = createRouter({
+			clock: clock.now,
+			perRouteRateLimits: {
+				expensive: { refillPerSecond: 1, tokens: 2 },
+			},
+			perTenantRateLimit: { refillPerSecond: 10, tokens: 100 },
+			shards: makeShards(1),
+		});
+		const route = 'expensive';
+		expect(router.route({ route, tenantId: 'acme' }).decision).toBe('allow');
+		expect(router.route({ route, tenantId: 'acme' }).decision).toBe('allow');
+		const refused = router.route({ route, tenantId: 'acme' });
+		expect(refused.decision).toBe('rate-limited');
+		expect(refused.emptiedBucket).toBe('expensive');
+		// Other routes for the same tenant still work — the tenant bucket has 98 tokens left.
+		expect(router.route({ tenantId: 'acme' }).decision).toBe('allow');
+	});
+
+	test('rate-limited result reports tenant bucket when that one drains first', () => {
+		const router = createRouter({
+			perTenantRateLimit: { refillPerSecond: 0, tokens: 1 },
+			shards: makeShards(1),
+		});
+		expect(router.route({ tenantId: 't' }).decision).toBe('allow');
+		const refused = router.route({ tenantId: 't' });
+		expect(refused.decision).toBe('rate-limited');
+		expect(refused.emptiedBucket).toBe('tenant');
+	});
+
+	test('allow hook gate refuses a tenant the meter has tripped', () => {
+		const tripped = new Set<string>();
+		const router = createRouter({
+			allow: (tenant) => !tripped.has(tenant),
+			shards: makeShards(1),
+		});
+		expect(router.route({ tenantId: 'acme' }).decision).toBe('allow');
+		tripped.add('acme');
+		const refused = router.route({ tenantId: 'acme' });
+		expect(refused.decision).toBe('denied');
+		expect(refused.shard).toBeNull();
+		// Other tenants are unaffected.
+		expect(router.route({ tenantId: 'other' }).decision).toBe('allow');
+	});
+
+	test('failed bucket gates do not consume the OTHER bucket', () => {
+		const router = createRouter({
+			perRouteRateLimits: {
+				maxed: { refillPerSecond: 0, tokens: 0 },
+			},
+			perTenantRateLimit: { refillPerSecond: 0, tokens: 100 },
+			shards: makeShards(1),
+		});
+		const refused = router.route({ route: 'maxed', tenantId: 't' });
+		expect(refused.decision).toBe('rate-limited');
+		expect(refused.emptiedBucket).toBe('maxed');
+		// Tenant bucket should still have 100 — the route failed before we committed.
+		for (let i = 0; i < 100; i++) {
+			expect(router.route({ tenantId: 't' }).decision).toBe('allow');
+		}
+	});
+
+	test('snapshot serializes; restore recreates rate-limit state', () => {
+		let now = 1_000_000;
+		const router = createRouter({
+			clock: () => now,
+			perRouteRateLimits: { hot: { refillPerSecond: 0, tokens: 5 } },
+			perTenantRateLimit: { refillPerSecond: 0, tokens: 10 },
+			shards: makeShards(2),
+		});
+		// Drain some tokens.
+		router.route({ tenantId: 'acme' });
+		router.route({ tenantId: 'acme' });
+		router.route({ route: 'hot', tenantId: 'acme' });
+		router.drainShard('s1');
+
+		const snap = router.snapshot();
+		const json = JSON.parse(JSON.stringify(snap));
+
+		const next = createRouter({
+			clock: () => now,
+			perRouteRateLimits: { hot: { refillPerSecond: 0, tokens: 5 } },
+			perTenantRateLimit: { refillPerSecond: 0, tokens: 10 },
+			shards: makeShards(2),
+		});
+		next.restore(json);
+
+		// Drain state survived.
+		expect(next.isDraining('s1')).toBe(true);
+
+		// Tenant token state survived (we had 10, used 3 — leaving 7).
+		// 7 more allow calls succeed; the 8th is rate-limited.
+		for (let i = 0; i < 7; i++) {
+			expect(next.route({ tenantId: 'acme' }).decision).toBe('allow');
+		}
+		expect(next.route({ tenantId: 'acme' }).decision).toBe('rate-limited');
+	});
+
+	test('snapshot tenants/routeBuckets are the persistable shape (arrays)', () => {
+		const router = createRouter({
+			perTenantRateLimit: { refillPerSecond: 0, tokens: 5 },
+			shards: makeShards(1),
+		});
+		router.route({ tenantId: 'a' });
+		router.route({ tenantId: 'b' });
+		const snap = router.snapshot();
+		expect(Array.isArray(snap.tenants)).toBe(true);
+		expect(Array.isArray(snap.routeBuckets)).toBe(true);
+		expect(snap.tenants).toHaveLength(2);
 	});
 });

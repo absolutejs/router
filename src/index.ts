@@ -5,12 +5,13 @@
  * Sits between an incoming request / WS upgrade and N backend processes (each
  * one a `@absolutejs/runtime` instance hosting a `@absolutejs/sync` engine
  * for a subset of tenants). Decides which shard owns the tenant, whether the
- * tenant is over its rate limit, whether the tenant is over its connection
- * cap, and whether the chosen shard is healthy.
+ * tenant is over its rate limit (tenant-wide + per-route), whether the tenant
+ * is over its connection cap, whether the caller-supplied allow hook approves,
+ * and whether the chosen shard is healthy and not draining.
  *
- * v0.0.1 is intentionally bun/elysia-agnostic — pure logic, no `Bun.serve`
- * or proxy code. The caller wires the routing decision into whichever HTTP/WS
- * layer they have. An Elysia adapter ships in a later 0.0.x as a subpath.
+ * v0.1.0 is bun/elysia-agnostic — pure logic, no `Bun.serve` or proxy code.
+ * The caller wires the routing decision into whichever HTTP/WS layer they
+ * have. An Elysia adapter ships in a later 0.0.x as a subpath.
  */
 
 export type Shard = {
@@ -30,8 +31,8 @@ export type Shard = {
 
 /**
  * Pure hash-strategy function. Given the routing key + the list of currently
- * healthy shards (with their weights), return the index in `shards` of the
- * chosen shard. The router never calls a strategy with an empty `shards`
+ * eligible shards (healthy AND not draining), return the index in `shards` of
+ * the chosen shard. The router never calls a strategy with an empty `shards`
  * array — that case is handled upstream as `no-shards`.
  */
 export type HashStrategyFn = (key: string, shards: ReadonlyArray<Shard>) => number;
@@ -47,6 +48,25 @@ export type RateLimit = {
 	tokens: number;
 	refillPerSecond: number;
 };
+
+/**
+ * Optional caller-supplied gate. Called per-route with the tenant id; returning
+ * `false` causes the route to return `decision: 'denied'`. The intended
+ * use is `meter.allow` from `@absolutejs/metering` — pass it directly to refuse
+ * routes for over-quota tenants without wiring the integration manually.
+ */
+export type AllowHook = (tenantId: string) => boolean;
+
+/**
+ * Optional caller-supplied load metric. Called per `route()` with a shard id;
+ * returning a value > 1 makes the rendezvous strategy bias AWAY from this shard
+ * (effective weight = `shard.weight / load`). Used to avoid hot-spotting when
+ * a stickiness-locked shard is overloaded — the router can't move existing
+ * tenants, but it can avoid sending NEW tenants there.
+ *
+ * Jump-hash ignores this — it has no per-call weight bias by design.
+ */
+export type ShardLoadFn = (shardId: string) => number;
 
 export type RouterOptions = {
 	/** Initial shard set. Can be empty (every `route()` returns `no-shards`). */
@@ -65,11 +85,28 @@ export type RouterOptions = {
 	 * `'rate-limited'`. One `route()` call costs one token.
 	 */
 	perTenantRateLimit?: RateLimit;
+	/**
+	 * Per-route token buckets layered on top of the tenant-wide bucket.
+	 * Keyed by route name; supplied by the caller via
+	 * `route({ route: 'someRoute' })`. The tenant bucket AND the route bucket
+	 * must both have a token available. When the route bucket is empty,
+	 * `route()` returns `'rate-limited'` with `routeId` set.
+	 */
+	perRouteRateLimits?: Record<string, RateLimit>;
+	/** Optional load hook biasing the rendezvous strategy. */
+	load?: ShardLoadFn;
+	/** Optional caller-supplied allow gate. */
+	allow?: AllowHook;
 	/** Override `Date.now` for tests. */
 	clock?: () => number;
 };
 
-export type RouteDecision = 'allow' | 'rate-limited' | 'capped' | 'no-shards';
+export type RouteDecision =
+	| 'allow'
+	| 'rate-limited'
+	| 'capped'
+	| 'no-shards'
+	| 'denied';
 
 export type RouteRequest = {
 	tenantId: string;
@@ -81,12 +118,23 @@ export type RouteRequest = {
 	 * tenant may land on different shards.
 	 */
 	channelId?: string;
+	/**
+	 * Optional per-route rate-limit key. Looked up in `perRouteRateLimits`.
+	 * Unknown routes pass without per-route gating (only the tenant-wide
+	 * bucket applies).
+	 */
+	route?: string;
 };
 
 export type RouteResult = {
 	decision: RouteDecision;
-	/** The chosen shard. `null` only when `decision === 'no-shards'`. */
+	/** The chosen shard. `null` when `decision !== 'allow'`. */
 	shard: Shard | null;
+	/**
+	 * Set on a `'rate-limited'` result to tell the caller which bucket emptied:
+	 * `'tenant'` for the tenant-wide bucket, the route id for a per-route bucket.
+	 */
+	emptiedBucket?: 'tenant' | string;
 };
 
 export type AcquireHandle = {
@@ -97,8 +145,21 @@ export type AcquireHandle = {
 };
 
 export type RouterSnapshot = {
-	shards: Array<Shard & { healthy: boolean; active: number }>;
-	tenants: number;
+	version: 1;
+	at: number;
+	shards: Array<Shard & { healthy: boolean; draining: boolean; active: number }>;
+	tenants: Array<{
+		tenant: string;
+		active: number;
+		tokens: number;
+		lastRefillAt: number;
+	}>;
+	routeBuckets: Array<{
+		tenant: string;
+		route: string;
+		tokens: number;
+		lastRefillAt: number;
+	}>;
 };
 
 export type Router = {
@@ -106,10 +167,22 @@ export type Router = {
 	acquire: (tenantId: string) => AcquireHandle;
 	markHealthy: (shardId: string) => void;
 	markUnhealthy: (shardId: string) => void;
+	/**
+	 * Begin draining a shard — exclude it from new routing decisions while
+	 * leaving existing acquires alone. Semantically distinct from
+	 * `markUnhealthy` (an operator-intentional state, not a failure).
+	 * `markHealthy` cancels both states. Use this before a planned shard
+	 * shutdown — tenants on the shard rehash to healthy non-draining shards
+	 * on their next route, but in-flight requests are NOT torn down.
+	 */
+	drainShard: (shardId: string) => void;
+	isHealthy: (shardId: string) => boolean;
+	isDraining: (shardId: string) => boolean;
 	addShard: (shard: Shard) => void;
 	removeShard: (shardId: string) => void;
 	shards: () => Shard[];
 	snapshot: () => RouterSnapshot;
+	restore: (snapshot: RouterSnapshot) => void;
 	dispose: () => void;
 };
 
@@ -133,9 +206,7 @@ const fnv1a32 = (input: string): number => {
 /**
  * Jump-consistent-hash, Lamping & Veach 2014. Maps a 64-bit key to a bucket
  * in `[0, numBuckets)`. Properties: O(log n), no memory, exactly 1/N keys
- * move when buckets are added at the tail. We mix a 32-bit FNV-1a into a
- * 64-bit-ish state via bigint to satisfy the 64-bit arithmetic the algorithm
- * expects.
+ * move when buckets are added at the tail.
  */
 const jumpHash = (key: string, numBuckets: number): number => {
 	if (numBuckets <= 0) return -1;
@@ -145,7 +216,6 @@ const jumpHash = (key: string, numBuckets: number): number => {
 	while (j < BigInt(numBuckets)) {
 		b = j;
 		k = (k * 2862933555777941757n + 1n) & 0xffffffffffffffffn;
-		// (b + 1) * (1 << 31) / ((k >> 33) + 1)
 		const shifted = (k >> 33n) + 1n;
 		j = ((b + 1n) * (1n << 31n)) / shifted;
 	}
@@ -154,23 +224,18 @@ const jumpHash = (key: string, numBuckets: number): number => {
 
 const jumpStrategy: HashStrategyFn = (key, shards) => jumpHash(key, shards.length);
 
-/**
- * Rendezvous (highest-random-weight) hash. For each shard, compute
- * `score = weight * -ln(rand(hash(key + shard.id)))`; pick the shard with
- * the highest score. Properties: supports per-shard weighting, single-shard
- * change moves only that shard's "winning" keys, O(N) per lookup.
- */
-const rendezvousStrategy: HashStrategyFn = (key, shards) => {
+const makeRendezvousStrategy = (load?: ShardLoadFn): HashStrategyFn => (key, shards) => {
 	let bestIndex = 0;
 	let bestScore = -Infinity;
 	for (let i = 0; i < shards.length; i++) {
 		const shard = shards[i]!;
-		const weight = shard.weight ?? 1;
-		if (weight <= 0) continue;
+		const baseWeight = shard.weight ?? 1;
+		if (baseWeight <= 0) continue;
+		const loadValue = load ? Math.max(load(shard.id), 0.0001) : 1;
+		const effectiveWeight = baseWeight / loadValue;
 		const seed = fnv1a32(`${key}|${shard.id}`);
-		// Map [0, 2^32) to (0, 1) and take -ln. Heavier weight = higher expected score.
 		const u = (seed + 1) / 0x1_0000_0000;
-		const score = weight * -Math.log(u);
+		const score = effectiveWeight * -Math.log(u);
 		if (score > bestScore) {
 			bestScore = score;
 			bestIndex = i;
@@ -179,9 +244,9 @@ const rendezvousStrategy: HashStrategyFn = (key, shards) => {
 	return bestIndex;
 };
 
-const resolveStrategy = (strategy: HashStrategy): HashStrategyFn => {
+const resolveStrategy = (strategy: HashStrategy, load?: ShardLoadFn): HashStrategyFn => {
 	if (strategy === 'jump') return jumpStrategy;
-	if (strategy === 'rendezvous') return rendezvousStrategy;
+	if (strategy === 'rendezvous') return makeRendezvousStrategy(load);
 	return strategy;
 };
 
@@ -189,29 +254,37 @@ const resolveStrategy = (strategy: HashStrategy): HashStrategyFn => {
 // Router
 // -----------------------------------------------------------------------------
 
-type TenantState = {
-	active: number;
+type Bucket = {
 	tokens: number;
 	lastRefillAt: number;
 };
 
+type TenantState = {
+	active: number;
+	bucket: Bucket;
+};
+
 export const createRouter = (options: RouterOptions): Router => {
 	const clock = options.clock ?? Date.now;
-	const strategy = resolveStrategy(options.hashStrategy ?? 'jump');
+	const strategy = resolveStrategy(options.hashStrategy ?? 'jump', options.load);
 	const cap = options.perTenantConnectionCap ?? Infinity;
 	const rate = options.perTenantRateLimit ?? { refillPerSecond: 0, tokens: Infinity };
+	const perRouteRateLimits = options.perRouteRateLimits ?? {};
+	const allowHook = options.allow;
 
 	const shardList: Shard[] = [...options.shards];
 	const healthy = new Map<string, boolean>();
+	const draining = new Set<string>();
 	for (const shard of shardList) healthy.set(shard.id, true);
 
 	const tenants = new Map<string, TenantState>();
+	/** Per-tenant per-route bucket. Key = `${tenant}|${route}`. */
+	const routeBuckets = new Map<string, Bucket>();
 	let disposed = false;
 
 	const freshTenant = (now: number): TenantState => ({
 		active: 0,
-		lastRefillAt: now,
-		tokens: rate.tokens,
+		bucket: { lastRefillAt: now, tokens: rate.tokens },
 	});
 
 	const ensureTenant = (id: string, now: number): TenantState => {
@@ -222,22 +295,36 @@ export const createRouter = (options: RouterOptions): Router => {
 		return fresh;
 	};
 
-	const refill = (state: TenantState, now: number) => {
-		if (rate.refillPerSecond <= 0) return;
-		const elapsedMs = now - state.lastRefillAt;
+	const refillBucket = (bucket: Bucket, rule: RateLimit, now: number) => {
+		if (rule.refillPerSecond <= 0) return;
+		const elapsedMs = now - bucket.lastRefillAt;
 		if (elapsedMs <= 0) return;
-		const added = (elapsedMs / 1000) * rate.refillPerSecond;
-		state.tokens = Math.min(rate.tokens, state.tokens + added);
-		state.lastRefillAt = now;
+		const added = (elapsedMs / 1000) * rule.refillPerSecond;
+		bucket.tokens = Math.min(rule.tokens, bucket.tokens + added);
+		bucket.lastRefillAt = now;
 	};
 
-	const healthyShards = (): Shard[] => shardList.filter((shard) => healthy.get(shard.id) === true);
+	const ensureRouteBucket = (tenant: string, route: string, rule: RateLimit, now: number): Bucket => {
+		const key = `${tenant}|${route}`;
+		const found = routeBuckets.get(key);
+		if (found) return found;
+		const fresh: Bucket = { lastRefillAt: now, tokens: rule.tokens };
+		routeBuckets.set(key, fresh);
+		return fresh;
+	};
+
+	const eligibleShards = (): Shard[] =>
+		shardList.filter((shard) => healthy.get(shard.id) === true && !draining.has(shard.id));
 
 	const route: Router['route'] = (request) => {
 		if (disposed) return { decision: 'no-shards', shard: null };
 
-		const live = healthyShards();
+		const live = eligibleShards();
 		if (live.length === 0) return { decision: 'no-shards', shard: null };
+
+		if (allowHook && !allowHook(request.tenantId)) {
+			return { decision: 'denied', shard: null };
+		}
 
 		const now = clock();
 		const state = ensureTenant(request.tenantId, now);
@@ -246,11 +333,25 @@ export const createRouter = (options: RouterOptions): Router => {
 			return { decision: 'capped', shard: null };
 		}
 
-		refill(state, now);
-		if (state.tokens < 1) {
-			return { decision: 'rate-limited', shard: null };
+		refillBucket(state.bucket, rate, now);
+		if (state.bucket.tokens < 1) {
+			return { decision: 'rate-limited', emptiedBucket: 'tenant', shard: null };
 		}
-		state.tokens -= 1;
+
+		let routeBucket: Bucket | null = null;
+		let routeRule: RateLimit | null = null;
+		if (request.route !== undefined && perRouteRateLimits[request.route] !== undefined) {
+			routeRule = perRouteRateLimits[request.route]!;
+			routeBucket = ensureRouteBucket(request.tenantId, request.route, routeRule, now);
+			refillBucket(routeBucket, routeRule, now);
+			if (routeBucket.tokens < 1) {
+				return { decision: 'rate-limited', emptiedBucket: request.route, shard: null };
+			}
+		}
+
+		// Commit both buckets only after both passed.
+		state.bucket.tokens -= 1;
+		if (routeBucket) routeBucket.tokens -= 1;
 
 		const key = request.channelId === undefined
 			? request.tenantId
@@ -287,10 +388,20 @@ export const createRouter = (options: RouterOptions): Router => {
 			disposed = true;
 			shardList.length = 0;
 			healthy.clear();
+			draining.clear();
 			tenants.clear();
+			routeBuckets.clear();
 		},
+		drainShard: (id) => {
+			if (healthy.has(id)) draining.add(id);
+		},
+		isDraining: (id) => draining.has(id),
+		isHealthy: (id) => healthy.get(id) === true,
 		markHealthy: (id) => {
-			if (healthy.has(id)) healthy.set(id, true);
+			if (healthy.has(id)) {
+				healthy.set(id, true);
+				draining.delete(id);
+			}
 		},
 		markUnhealthy: (id) => {
 			if (healthy.has(id)) healthy.set(id, false);
@@ -299,16 +410,68 @@ export const createRouter = (options: RouterOptions): Router => {
 			const at = shardList.findIndex((shard) => shard.id === id);
 			if (at >= 0) shardList.splice(at, 1);
 			healthy.delete(id);
+			draining.delete(id);
 		},
 		route,
 		shards: () => shardList.map((shard) => ({ ...shard })),
-		snapshot: () => ({
-			shards: shardList.map((shard) => ({
-				...shard,
-				active: 0,
-				healthy: healthy.get(shard.id) === true,
-			})),
-			tenants: tenants.size,
-		}),
+		snapshot: () => {
+			const now = clock();
+			const tenantsOut: RouterSnapshot['tenants'] = [];
+			for (const [tenant, state] of tenants) {
+				tenantsOut.push({
+					active: state.active,
+					lastRefillAt: state.bucket.lastRefillAt,
+					tenant,
+					tokens: state.bucket.tokens,
+				});
+			}
+			const routesOut: RouterSnapshot['routeBuckets'] = [];
+			for (const [key, bucket] of routeBuckets) {
+				const pipe = key.indexOf('|');
+				if (pipe < 0) continue;
+				routesOut.push({
+					lastRefillAt: bucket.lastRefillAt,
+					route: key.slice(pipe + 1),
+					tenant: key.slice(0, pipe),
+					tokens: bucket.tokens,
+				});
+			}
+			return {
+				at: now,
+				routeBuckets: routesOut,
+				shards: shardList.map((shard) => {
+					const active = Array.from(tenants.values()).reduce((acc, state) => acc + state.active, 0);
+					return {
+						...shard,
+						active,
+						draining: draining.has(shard.id),
+						healthy: healthy.get(shard.id) === true,
+					};
+				}),
+				tenants: tenantsOut,
+				version: 1,
+			};
+		},
+		restore: (snap) => {
+			tenants.clear();
+			routeBuckets.clear();
+			draining.clear();
+			for (const t of snap.tenants) {
+				tenants.set(t.tenant, {
+					active: t.active,
+					bucket: { lastRefillAt: t.lastRefillAt, tokens: t.tokens },
+				});
+			}
+			for (const r of snap.routeBuckets) {
+				routeBuckets.set(`${r.tenant}|${r.route}`, {
+					lastRefillAt: r.lastRefillAt,
+					tokens: r.tokens,
+				});
+			}
+			for (const shard of snap.shards) {
+				healthy.set(shard.id, shard.healthy);
+				if (shard.draining) draining.add(shard.id);
+			}
+		},
 	};
 };

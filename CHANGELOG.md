@@ -1,5 +1,62 @@
 # @absolutejs/router changelog
 
+## 0.1.0 — 2026-05-29
+
+Substrate-deepening pass. Mostly additive; one breaking change to the
+0.0.1 `snapshot()` return shape — see "Breaking" below.
+
+### Added
+
+- **`drainShard(shardId)`** — exclude a shard from new routing decisions
+  while leaving existing acquires alone. Semantically distinct from
+  `markUnhealthy` (an operator-intentional state, not a failure).
+  `markHealthy` cancels both states. Use this before a planned shard
+  shutdown: tenants on the draining shard rehash to healthy non-draining
+  shards on their next route; in-flight requests are NOT torn down.
+- **`isDraining(shardId)` / `isHealthy(shardId)`** — inspect the state.
+- **`load: (shardId) => number` option.** Bias the **rendezvous** strategy
+  away from overloaded shards. `effectiveWeight = shard.weight / load(id)`.
+  Higher load = lower effective weight = less likely to be picked. Jump
+  hash ignores this (its by-design property: ~1/N movement on shard
+  change). Useful when a stickiness-locked shard is hot — the router
+  can't move existing tenants, but it can avoid sending NEW tenants there.
+- **`perRouteRateLimits: Record<string, RateLimit>` option.** Per-route
+  token buckets layered on top of the tenant-wide bucket. `route()` now
+  accepts an optional `route` field; if set, the matching bucket is
+  checked alongside the tenant bucket — both must have a token for the
+  request to pass. A `rate-limited` result reports which bucket emptied
+  via the new `emptiedBucket` field (`'tenant'` or the route id).
+- **`allow: (tenantId) => boolean` option.** Caller-supplied gate. When
+  it returns `false`, `route()` returns `{ decision: 'denied' }`. The
+  intended pairing is `@absolutejs/metering`'s `meter.allow` — pass it
+  directly and the router refuses routes for over-quota tenants without
+  any wiring on the caller's side.
+- **`route()` `denied` decision** — paired with the `allow` hook above.
+- **`route()` `emptiedBucket` field** — set on `rate-limited` results so
+  the caller knows which bucket to surface to the user (and which to
+  watch for refill).
+- **`restore(snapshot)`** — repopulate router state from a previously
+  captured `snapshot()`. Preserves rate-limit tokens, shard health +
+  drain state, per-tenant active counts. Useful so an edge restart
+  doesn't suddenly let everyone fire one fresh token's worth of traffic.
+
+### Breaking
+
+- **`snapshot()` shape changed.** Was
+  `{ shards, tenants: number }`; is now
+  `{ version, at, shards, tenants: Array, routeBuckets: Array }`. The
+  `tenants` field went from a count to a list of `{ tenant, active,
+  tokens, lastRefillAt }`. Existing consumers reading `snap.tenants` as a
+  number need to read `snap.tenants.length` instead. snapshot() was
+  observation-only in 0.0.1 (no `restore()` existed); 0.1.0 makes it the
+  serializable persistence format that pairs with `restore()`.
+
+### Internal
+
+- Rendezvous strategy now closes over the `load` hook at creation time
+  rather than per-call. No observable behavior change beyond the load
+  bias.
+
 ## 0.0.1 — 2026-05-29
 
 Initial release.

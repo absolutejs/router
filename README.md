@@ -37,25 +37,30 @@ ws.data = { ...ws.data, release: handle.release, upstream: decision.shard!.url }
 // ...proxy WS frames to decision.shard.url; call handle.release() on close.
 ```
 
-## v0.0.1 surface
+## Surface (0.1.0)
 
 | API | Purpose |
 |---|---|
 | `createRouter(options)` | Factory. Returns a `Router`. |
-| `router.route({ tenantId, channelId? })` | Returns `{ shard, decision }`. Decision is `allow` / `rate-limited` / `capped` / `no-shards`. |
-| `router.acquire(tenantId)` | Increment a tenant's active-connection counter; returns `{ active, release }`. `release` is idempotent. |
-| `router.markHealthy(id)` / `router.markUnhealthy(id)` | Caller-driven health state. Unhealthy shards are skipped; tenants on them rehash to healthy ones. |
+| `router.route({ tenantId, channelId?, route? })` | Returns `{ shard, decision, emptiedBucket? }`. Decision is `allow` / `rate-limited` / `capped` / `no-shards` / `denied`. |
+| `router.acquire(tenantId)` | Increment active-connection counter; returns `{ active, release }`. `release` is idempotent. |
+| `router.markHealthy(id)` / `router.markUnhealthy(id)` | Caller-driven health state. Unhealthy shards are skipped. |
+| `router.drainShard(id)` | Refuse new routes; existing acquires unaffected. Operator-intentional state distinct from unhealthy. `markHealthy` cancels it. |
+| `router.isHealthy(id)` / `router.isDraining(id)` | Inspect state. |
 | `router.addShard(shard)` / `router.removeShard(id)` | Runtime shard membership changes. |
-| `router.shards()` / `router.snapshot()` | Inspection. |
+| `router.shards()` | Inspect shard list. |
+| `router.snapshot()` / `router.restore(snap)` | Serializable point-in-time state. Survive edge restarts without dropping rate-limit tokens. |
 | `router.dispose()` | Stop accepting routes; all subsequent `route()` returns `no-shards`. |
 
-### Hash strategies
+### Hash strategies + load bias
 
-- **`jump`** (default) — Lamping & Veach 2014. O(log n) with no memory, exactly
-  1/N keys move when shards are added at the tail. Ignores `weight`.
-- **`rendezvous`** — HRW hash. Supports per-shard `weight` for heterogeneous
-  engine sizes. O(N) per lookup.
+- **`jump`** (default) — Lamping & Veach 2014. O(log n) with no memory, exactly 1/N keys move when shards are added at the tail. Ignores `weight` AND `load` (its design property is unconditional stickiness).
+- **`rendezvous`** — HRW hash. Supports per-shard `weight` for heterogeneous engine sizes; ALSO supports the `load: (shardId) => number` hook for runtime hot-spot avoidance — `effectiveWeight = weight / load`. O(N) per lookup.
 - **Custom**: pass `(key, shards) => index`.
+
+### Drain mode
+
+`drainShard(id)` excludes a shard from new routing without marking it broken. Use this before a planned shard shutdown — tenants on the draining shard rehash to healthy non-draining shards on their NEXT route, but in-flight requests aren't torn down. The caller waits for the shard to be quiet (e.g. via the runtime's stats), then `removeShard()`. `markHealthy()` cancels a drain in case ops changes their mind.
 
 ### Connection cap
 
@@ -64,19 +69,41 @@ counted via `acquire()` / the returned `release()`. When reached, `route()`
 returns `capped` — your gateway should refuse the upgrade with `429` /
 `503`. Default `Infinity` (no cap).
 
-### Rate limit
+### Rate limits — tenant + per-route
 
-`perTenantRateLimit` is a token bucket per tenant: `tokens` is bucket capacity
-AND starting balance; `refillPerSecond` continuously refills up to capacity.
-Each successful `route()` costs one token. Bucket is computed lazily at lookup
-time — no timer churn for idle tenants. Default `{ tokens: Infinity,
-refillPerSecond: 0 }` (no limit).
+`perTenantRateLimit` is a token bucket per tenant: `tokens` is bucket capacity AND starting balance; `refillPerSecond` continuously refills up to capacity. Each successful `route()` costs one token. Bucket is computed lazily at lookup time — no timer churn for idle tenants. Default `{ tokens: Infinity, refillPerSecond: 0 }` (no limit).
+
+`perRouteRateLimits: Record<string, RateLimit>` layers a SECOND per-route bucket on top of the tenant-wide one. `route({ route: 'expensive' })` checks both; if either is empty, the call returns `rate-limited` with `emptiedBucket` reporting which one. Useful for "100 cheap calls / minute, 5 expensive calls / minute" shapes where one tenant-wide cap won't express the policy. **A failed route bucket does NOT consume the tenant bucket** — neither token is deducted unless both pass.
+
+### Allow hook (meter integration)
+
+`allow: (tenantId) => boolean` is a caller-supplied gate. Returning `false` makes `route()` return `{ decision: 'denied' }` immediately, before any bucket is touched. The intended pairing is `@absolutejs/metering`'s `meter.allow` — pass it directly:
+
+```ts
+const meter = createMeter({ ... });
+const router = createRouter({
+  shards,
+  allow: meter.allow,                // refuse routes for over-quota tenants
+  load: (id) => runtimeRoster.load(id), // and bias toward less-loaded shards
+});
+```
 
 ### Health
 
-The router does not probe backends itself — keeping it bun/elysia-free means
-no I/O. Wire your own health-check loop and call `markHealthy` / `markUnhealthy`.
-A live health-checking adapter is a candidate for a later 0.0.x subpath.
+The router does not probe backends itself — keeping it bun/elysia-free means no I/O. Wire your own health-check loop and call `markHealthy` / `markUnhealthy`. A live health-checking adapter is a candidate for a later 0.0.x subpath.
+
+### Snapshot + restore
+
+```ts
+const json = JSON.stringify(router.snapshot());
+await persistToDisk('/var/lib/router/state.json', json);
+
+// On edge restart:
+const restored = createRouter({ ... same config ... });
+restored.restore(JSON.parse(await readFromDisk('/var/lib/router/state.json')));
+```
+
+Captures rate-limit token counts, per-route bucket state, shard health + drain state, per-tenant active connection counts. Without this, an edge restart hands every tenant a fresh full bucket — instant rate-limit-bypass for anyone watching the deploy times.
 
 ## Architectural role
 

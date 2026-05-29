@@ -1,6 +1,6 @@
 {
   "name": "@absolutejs/router",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Multi-tenant connection routing primitive for Bun PaaS gateways. Consistent-hash tenant→shard, per-tenant connection cap, per-tenant rate limit, healthy-shard skip. The library that goes in front of N @absolutejs/runtime instances.",
   "repository": {
     "type": "git",
