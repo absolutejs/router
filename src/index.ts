@@ -14,6 +14,12 @@
  * have. An Elysia adapter ships in a later 0.0.x as a subpath.
  */
 
+import {
+	ABS_ATTRS,
+	tracerOrNoop,
+	type TracerProvider
+} from '@absolutejs/telemetry';
+
 export type Shard = {
 	id: string;
 	/**
@@ -99,6 +105,17 @@ export type RouterOptions = {
 	allow?: AllowHook;
 	/** Override `Date.now` for tests. */
 	clock?: () => number;
+	/**
+	 * Optional OpenTelemetry tracer provider. When set, `route()` and
+	 * `acquire()` are wrapped in `router.route` / `router.acquire`
+	 * spans with `abs.tenant`, `abs.route.decision`, and (on allow)
+	 * `abs.route.shard` attributes. When omitted, all tracing is a
+	 * zero-allocation noop. Added in 0.3.0.
+	 *
+	 * Structural type via `@absolutejs/telemetry`; no peer-dep on
+	 * `@opentelemetry/api`.
+	 */
+	tracerProvider?: TracerProvider;
 };
 
 export type RouteDecision =
@@ -316,6 +333,8 @@ export const createRouter = (options: RouterOptions): Router => {
 	/** Per-tenant per-route bucket. Key = `${tenant}|${route}`. */
 	const routeBuckets = new Map<string, Bucket>();
 	let disposed = false;
+	// 0.3.0: OTel tracer (noop when options.tracerProvider unset).
+	const tracer = tracerOrNoop(options.tracerProvider, '@absolutejs/router');
 	// 0.2.0: cumulative operator counters. Per-shard active count is
 	// derived from `acquires` minus per-shard releases — but tracking
 	// per-shard requires routing → acquire correlation that the
@@ -372,14 +391,36 @@ export const createRouter = (options: RouterOptions): Router => {
 		shardList.filter((shard) => healthy.get(shard.id) === true && !draining.has(shard.id));
 
 	const route: Router['route'] = (request) => {
+		// 0.3.0: span the routing decision. Hot-path safe — when no
+		// tracerProvider is set, the noop tracer's startSpan returns
+		// the singleton noop span (zero allocation).
+		const span = tracer.startSpan('router.route', {
+			attributes: {
+				[ABS_ATTRS.tenant]: request.tenantId,
+				...(request.route !== undefined
+					? { 'abs.route.name': request.route }
+					: {})
+			}
+		});
 		const routeStart = clock();
 		totalRoutes += 1;
+		const finishSpan = (result: RouteResult): RouteResult => {
+			span.setAttribute(ABS_ATTRS.routeDecision, result.decision);
+			if (result.shard !== null) {
+				span.setAttribute(ABS_ATTRS.routeShard, result.shard.id);
+			}
+			span.setStatus({
+				code: result.decision === 'allow' ? 1 /* OK */ : 2 /* ERROR */
+			});
+			span.end();
+			return result;
+		};
 		const recordRejection = (
 			decision: Exclude<RouteDecision, 'allow'>
 		): RouteResult => {
 			rejectsByDecision[decision] += 1;
 			lastRouteMs = clock() - routeStart;
-			return { decision, shard: null };
+			return finishSpan({ decision, shard: null });
 		};
 		if (disposed) return recordRejection('no-shards');
 
@@ -401,11 +442,11 @@ export const createRouter = (options: RouterOptions): Router => {
 		if (state.bucket.tokens < 1) {
 			rejectsByDecision['rate-limited'] += 1;
 			lastRouteMs = clock() - routeStart;
-			return {
+			return finishSpan({
 				decision: 'rate-limited',
 				emptiedBucket: 'tenant',
 				shard: null
-			};
+			});
 		}
 
 		let routeBucket: Bucket | null = null;
@@ -417,11 +458,11 @@ export const createRouter = (options: RouterOptions): Router => {
 			if (routeBucket.tokens < 1) {
 				rejectsByDecision['rate-limited'] += 1;
 				lastRouteMs = clock() - routeStart;
-				return {
+				return finishSpan({
 					decision: 'rate-limited',
 					emptiedBucket: request.route,
 					shard: null
-				};
+				});
 			}
 		}
 
@@ -439,14 +480,24 @@ export const createRouter = (options: RouterOptions): Router => {
 			(shardLoadByShard.get(chosen.id) ?? 0) + 1
 		);
 		lastRouteMs = clock() - routeStart;
-		return { decision: 'allow', shard: chosen };
+		return finishSpan({ decision: 'allow', shard: chosen });
 	};
 
 	const acquire: Router['acquire'] = (tenantId) => {
+		// 0.3.0: span the acquire. It's instantaneous bookkeeping, but
+		// the per-tenant active count is one of the most operationally
+		// interesting metrics — a sustained climb signals tenants
+		// holding more connections than expected.
+		const span = tracer.startSpan('router.acquire', {
+			attributes: { [ABS_ATTRS.tenant]: tenantId }
+		});
 		const now = clock();
 		const state = ensureTenant(tenantId, now);
 		state.active += 1;
 		totalAcquires += 1;
+		span.setAttribute('abs.tenant.active', state.active);
+		span.setStatus({ code: 1 /* OK */ });
+		span.end();
 		let released = false;
 		return {
 			active: state.active,

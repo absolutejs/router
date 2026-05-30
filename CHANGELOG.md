@@ -1,5 +1,28 @@
 # @absolutejs/router changelog
 
+## 0.3.0 — 2026-05-30
+
+### Added — OpenTelemetry tracing via @absolutejs/telemetry
+
+Closes G2 (deep-research audit) for the router.
+
+- **`RouterOptions.tracerProvider?: TracerProvider`** — any
+  `@opentelemetry/api`-compatible. Structural type via
+  `@absolutejs/telemetry`; no peer-dep on `@opentelemetry/api`.
+- **`router.route` span** per `route()` call. Attributes: `abs.tenant`,
+  `abs.route.decision`, `abs.route.shard` (on allow), `abs.route.name`
+  (when supplied). Status OK on `allow`; ERROR on rejection
+  (`rate-limited` / `capped` / `denied` / `no-shards`).
+- **`router.acquire` span** per `acquire()` with `abs.tenant` +
+  `abs.tenant.active` (active count after the increment).
+- `@absolutejs/telemetry` added as a regular dep.
+- Zero-cost when `tracerProvider` is omitted (noop tracer singleton).
+
+5 new tests in `tests/tracing.test.ts`: allow / denied / rate-limited /
+acquire / noop fallback.
+
+Test count: 34 → 39.
+
 ## 0.2.0 — 2026-05-29
 
 Substrate-pattern uniformity. Backwards-compatible — `snapshot()` keeps
