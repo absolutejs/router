@@ -1,5 +1,31 @@
 # @absolutejs/router changelog
 
+## 0.2.0 — 2026-05-29
+
+Substrate-pattern uniformity. Backwards-compatible — `snapshot()` keeps
+its persistence shape; `metrics()` is the new operator-shaped surface.
+
+### Added
+
+- **`Router.metrics()`** returning `RouterMetrics`:
+  - `routes` — total `route()` calls (any decision).
+  - `acquires` — total `acquire()` calls.
+  - `rejectsByDecision` — `Record<Exclude<RouteDecision, 'allow'>, number>`
+    counting `rate-limited` / `capped` / `no-shards` / `denied`. The
+    operator's "where am I shedding load?" surface.
+  - `shardLoadDistribution` — cumulative `allow` routes assigned per
+    shard since start. With `markHealthy` / `drainShard` this is the
+    "is rebalancing actually rebalancing?" signal.
+  - `lastRouteMs` — wall-clock of the most recent `route()` call. A
+    climb signals the hot path is getting slower (often the `load:`
+    hook is doing too much work).
+- Counters survive `dispose()` for post-shutdown introspection.
+
+`snapshot()` kept unchanged — its job is persistence (restore tenant
++ bucket state across a shard reboot); `metrics()` is monitoring.
+
+10 new tests in `tests/metrics.test.ts`. Test count: 24 → 34.
+
 ## 0.1.0 — 2026-05-29
 
 Substrate-deepening pass. Mostly additive; one breaking change to the

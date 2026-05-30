@@ -108,6 +108,33 @@ export type RouteDecision =
 	| 'no-shards'
 	| 'denied';
 
+/**
+ * Returned by {@link Router.metrics}. Combines point-in-time state with
+ * cumulative counters since `createRouter()`. Survives `dispose()` so
+ * post-shutdown introspection still reads totals. Added in 0.2.0.
+ *
+ * - `routes` — total `route()` calls (any decision).
+ * - `acquires` — total `acquire()` calls.
+ * - `rejectsByDecision` — counts per non-allow `RouteDecision`. The
+ *   operator's "where am I shedding load?" answer.
+ * - `shardLoadDistribution` — cumulative routes assigned per shard
+ *   since `createRouter()`. With `markHealthy`/`drainShard` this is
+ *   the "is rebalancing actually rebalancing?" signal. (Per-shard
+ *   *active* connection count would require route-to-acquire
+ *   correlation that the current `acquire(tenantId)` API doesn't
+ *   capture; cumulative routes are the directly-observable proxy.)
+ * - `lastRouteMs` — wall-clock of the most recent `route()` call (a
+ *   climb means the hot path is getting slower — usually a sign that
+ *   `load:` is doing too much work, or the shard count exploded).
+ */
+export type RouterMetrics = {
+	routes: number;
+	acquires: number;
+	rejectsByDecision: Record<Exclude<RouteDecision, 'allow'>, number>;
+	shardLoadDistribution: Record<string, number>;
+	lastRouteMs: number;
+};
+
 export type RouteRequest = {
 	tenantId: string;
 	/**
@@ -183,6 +210,14 @@ export type Router = {
 	shards: () => Shard[];
 	snapshot: () => RouterSnapshot;
 	restore: (snapshot: RouterSnapshot) => void;
+	/**
+	 * Operator-shaped point-in-time + cumulative metrics since
+	 * `createRouter()`. Use for tier dashboards and "where am I
+	 * shedding load" alerts. Distinct from `snapshot()`, which is the
+	 * persistence shape (preserves tenant + bucket state across a
+	 * shard reboot). Added in 0.2.0.
+	 */
+	metrics: () => RouterMetrics;
 	dispose: () => void;
 };
 
@@ -281,6 +316,26 @@ export const createRouter = (options: RouterOptions): Router => {
 	/** Per-tenant per-route bucket. Key = `${tenant}|${route}`. */
 	const routeBuckets = new Map<string, Bucket>();
 	let disposed = false;
+	// 0.2.0: cumulative operator counters. Per-shard active count is
+	// derived from `acquires` minus per-shard releases — but tracking
+	// per-shard requires routing → acquire correlation that the
+	// existing API doesn't enforce. Use point-in-time aggregation from
+	// `tenants` Map: each tenant's active count contributes to its
+	// most-recently-routed shard. (Acquire isn't shard-tagged today;
+	// adding a `shardId` to the AcquireHandle is a separate change.)
+	let totalRoutes = 0;
+	let totalAcquires = 0;
+	let lastRouteMs = 0;
+	const rejectsByDecision: Record<
+		Exclude<RouteDecision, 'allow'>,
+		number
+	> = {
+		'rate-limited': 0,
+		'capped': 0,
+		'no-shards': 0,
+		'denied': 0
+	};
+	const shardLoadByShard = new Map<string, number>();
 
 	const freshTenant = (now: number): TenantState => ({
 		active: 0,
@@ -317,25 +372,40 @@ export const createRouter = (options: RouterOptions): Router => {
 		shardList.filter((shard) => healthy.get(shard.id) === true && !draining.has(shard.id));
 
 	const route: Router['route'] = (request) => {
-		if (disposed) return { decision: 'no-shards', shard: null };
+		const routeStart = clock();
+		totalRoutes += 1;
+		const recordRejection = (
+			decision: Exclude<RouteDecision, 'allow'>
+		): RouteResult => {
+			rejectsByDecision[decision] += 1;
+			lastRouteMs = clock() - routeStart;
+			return { decision, shard: null };
+		};
+		if (disposed) return recordRejection('no-shards');
 
 		const live = eligibleShards();
-		if (live.length === 0) return { decision: 'no-shards', shard: null };
+		if (live.length === 0) return recordRejection('no-shards');
 
 		if (allowHook && !allowHook(request.tenantId)) {
-			return { decision: 'denied', shard: null };
+			return recordRejection('denied');
 		}
 
-		const now = clock();
+		const now = routeStart;
 		const state = ensureTenant(request.tenantId, now);
 
 		if (state.active >= cap) {
-			return { decision: 'capped', shard: null };
+			return recordRejection('capped');
 		}
 
 		refillBucket(state.bucket, rate, now);
 		if (state.bucket.tokens < 1) {
-			return { decision: 'rate-limited', emptiedBucket: 'tenant', shard: null };
+			rejectsByDecision['rate-limited'] += 1;
+			lastRouteMs = clock() - routeStart;
+			return {
+				decision: 'rate-limited',
+				emptiedBucket: 'tenant',
+				shard: null
+			};
 		}
 
 		let routeBucket: Bucket | null = null;
@@ -345,7 +415,13 @@ export const createRouter = (options: RouterOptions): Router => {
 			routeBucket = ensureRouteBucket(request.tenantId, request.route, routeRule, now);
 			refillBucket(routeBucket, routeRule, now);
 			if (routeBucket.tokens < 1) {
-				return { decision: 'rate-limited', emptiedBucket: request.route, shard: null };
+				rejectsByDecision['rate-limited'] += 1;
+				lastRouteMs = clock() - routeStart;
+				return {
+					decision: 'rate-limited',
+					emptiedBucket: request.route,
+					shard: null
+				};
 			}
 		}
 
@@ -358,6 +434,11 @@ export const createRouter = (options: RouterOptions): Router => {
 			: `${request.tenantId}:${request.channelId}`;
 		const index = strategy(key, live);
 		const chosen = live[Math.max(0, Math.min(index, live.length - 1))]!;
+		shardLoadByShard.set(
+			chosen.id,
+			(shardLoadByShard.get(chosen.id) ?? 0) + 1
+		);
+		lastRouteMs = clock() - routeStart;
 		return { decision: 'allow', shard: chosen };
 	};
 
@@ -365,6 +446,7 @@ export const createRouter = (options: RouterOptions): Router => {
 		const now = clock();
 		const state = ensureTenant(tenantId, now);
 		state.active += 1;
+		totalAcquires += 1;
 		let released = false;
 		return {
 			active: state.active,
@@ -397,6 +479,13 @@ export const createRouter = (options: RouterOptions): Router => {
 		},
 		isDraining: (id) => draining.has(id),
 		isHealthy: (id) => healthy.get(id) === true,
+		metrics: () => ({
+			acquires: totalAcquires,
+			lastRouteMs,
+			rejectsByDecision: { ...rejectsByDecision },
+			routes: totalRoutes,
+			shardLoadDistribution: Object.fromEntries(shardLoadByShard)
+		}),
 		markHealthy: (id) => {
 			if (healthy.has(id)) {
 				healthy.set(id, true);
