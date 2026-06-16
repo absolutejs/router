@@ -6,6 +6,10 @@
     "type": "git",
     "url": "git+https://github.com/absolutejs/router.git"
   },
+  "homepage": "https://github.com/absolutejs/router",
+  "bugs": {
+    "url": "https://github.com/absolutejs/router/issues"
+  },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
