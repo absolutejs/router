@@ -4,14 +4,21 @@ import { createRouter, type Shard } from '../src';
 const clockFrom = (start = 1_000_000) => {
 	let now = start;
 	return {
-		advance: (ms: number) => { now += ms; },
+		advance: (ms: number) => {
+			now += ms;
+		},
 		now: () => now,
-		set: (value: number) => { now = value; },
+		set: (value: number) => {
+			now = value;
+		}
 	};
 };
 
 const makeShards = (n: number): Shard[] =>
-	Array.from({ length: n }, (_, i) => ({ id: `s${i}`, url: `ws://10.0.0.${i + 10}:3000` }));
+	Array.from({ length: n }, (_, i) => ({
+		id: `s${i}`,
+		url: `ws://10.0.0.${i + 10}:3000`
+	}));
 
 describe('createRouter', () => {
 	test('returns no-shards when nothing is registered', () => {
@@ -37,7 +44,10 @@ describe('createRouter', () => {
 		const counts = new Map<string, number>();
 		for (let i = 0; i < 1000; i++) {
 			const result = router.route({ tenantId: `tenant-${i}` });
-			counts.set(result.shard!.id, (counts.get(result.shard!.id) ?? 0) + 1);
+			counts.set(
+				result.shard!.id,
+				(counts.get(result.shard!.id) ?? 0) + 1
+			);
 		}
 		expect(counts.size).toBe(4);
 		// Tolerance: with N=1000 and 4 shards, each should be ~250 ± 50.
@@ -59,7 +69,8 @@ describe('createRouter', () => {
 		let moved = 0;
 		for (let i = 0; i < 1000; i++) {
 			const result = after.route({ tenantId: `tenant-${i}` });
-			if (result.shard!.id !== assignmentsBefore.get(`tenant-${i}`)) moved++;
+			if (result.shard!.id !== assignmentsBefore.get(`tenant-${i}`))
+				moved++;
 		}
 		// Jump hash moves exactly 1/N keys when buckets are added at the tail.
 		// Expect ~250 of 1000 — allow 100..400 for the FNV-seeded distribution.
@@ -71,7 +82,10 @@ describe('createRouter', () => {
 		const router = createRouter({ shards: makeShards(4) });
 		const assignments = new Set<string>();
 		for (let i = 0; i < 50; i++) {
-			const result = router.route({ channelId: `doc-${i}`, tenantId: 'acme' });
+			const result = router.route({
+				channelId: `doc-${i}`,
+				tenantId: 'acme'
+			});
 			assignments.add(result.shard!.id);
 		}
 		// At least 2 shards should have seen traffic for the single tenant.
@@ -83,8 +97,8 @@ describe('createRouter', () => {
 			hashStrategy: 'rendezvous',
 			shards: [
 				{ id: 'big', url: 'ws://10.0.0.1', weight: 8 },
-				{ id: 'small', url: 'ws://10.0.0.2', weight: 1 },
-			],
+				{ id: 'small', url: 'ws://10.0.0.2', weight: 1 }
+			]
 		});
 		const counts = { big: 0, small: 0 };
 		for (let i = 0; i < 5000; i++) {
@@ -105,7 +119,7 @@ describe('createRouter', () => {
 				seen.push(key);
 				return shards.length - 1;
 			},
-			shards: makeShards(3),
+			shards: makeShards(3)
 		});
 		const result = router.route({ channelId: 'room-7', tenantId: 'acme' });
 		expect(seen).toEqual(['acme:room-7']);
@@ -119,7 +133,10 @@ describe('createRouter', () => {
 		for (let i = 0; i < 200; i++) {
 			const tenant = `tenant-${i}`;
 			const result = router.route({ tenantId: tenant });
-			if (result.shard!.id === 's2') { pinnedTenant = tenant; break; }
+			if (result.shard!.id === 's2') {
+				pinnedTenant = tenant;
+				break;
+			}
 		}
 		expect(pinnedTenant).toBeDefined();
 
@@ -143,7 +160,7 @@ describe('createRouter', () => {
 	test('per-tenant connection cap returns "capped" once exceeded', () => {
 		const router = createRouter({
 			perTenantConnectionCap: 2,
-			shards: makeShards(2),
+			shards: makeShards(2)
 		});
 		const handle1 = router.acquire('acme');
 		const handle2 = router.acquire('acme');
@@ -161,7 +178,7 @@ describe('createRouter', () => {
 	test('release is idempotent', () => {
 		const router = createRouter({
 			perTenantConnectionCap: 1,
-			shards: makeShards(1),
+			shards: makeShards(1)
 		});
 		const handle = router.acquire('acme');
 		handle.release();
@@ -176,18 +193,22 @@ describe('createRouter', () => {
 		const router = createRouter({
 			clock: clock.now,
 			perTenantRateLimit: { refillPerSecond: 1, tokens: 3 },
-			shards: makeShards(1),
+			shards: makeShards(1)
 		});
 
 		expect(router.route({ tenantId: 'acme' }).decision).toBe('allow');
 		expect(router.route({ tenantId: 'acme' }).decision).toBe('allow');
 		expect(router.route({ tenantId: 'acme' }).decision).toBe('allow');
-		expect(router.route({ tenantId: 'acme' }).decision).toBe('rate-limited');
+		expect(router.route({ tenantId: 'acme' }).decision).toBe(
+			'rate-limited'
+		);
 
 		// 1 second elapses → 1 token refilled.
 		clock.advance(1000);
 		expect(router.route({ tenantId: 'acme' }).decision).toBe('allow');
-		expect(router.route({ tenantId: 'acme' }).decision).toBe('rate-limited');
+		expect(router.route({ tenantId: 'acme' }).decision).toBe(
+			'rate-limited'
+		);
 	});
 
 	test('rate-limit bucket never overflows past capacity', () => {
@@ -195,14 +216,16 @@ describe('createRouter', () => {
 		const router = createRouter({
 			clock: clock.now,
 			perTenantRateLimit: { refillPerSecond: 1, tokens: 3 },
-			shards: makeShards(1),
+			shards: makeShards(1)
 		});
 		// 10 seconds idle — bucket should clamp at 3, not 13.
 		clock.advance(10_000);
 		expect(router.route({ tenantId: 'acme' }).decision).toBe('allow');
 		expect(router.route({ tenantId: 'acme' }).decision).toBe('allow');
 		expect(router.route({ tenantId: 'acme' }).decision).toBe('allow');
-		expect(router.route({ tenantId: 'acme' }).decision).toBe('rate-limited');
+		expect(router.route({ tenantId: 'acme' }).decision).toBe(
+			'rate-limited'
+		);
 	});
 
 	test('addShard / removeShard adjust membership at runtime', () => {
@@ -210,7 +233,11 @@ describe('createRouter', () => {
 		expect(router.shards().map((shard) => shard.id)).toEqual(['s0', 's1']);
 
 		router.addShard({ id: 's2', url: 'ws://10.0.0.99' });
-		expect(router.shards().map((shard) => shard.id)).toEqual(['s0', 's1', 's2']);
+		expect(router.shards().map((shard) => shard.id)).toEqual([
+			's0',
+			's1',
+			's2'
+		]);
 
 		// Idempotent on duplicate id.
 		router.addShard({ id: 's2', url: 'ws://10.0.0.99' });
@@ -233,7 +260,9 @@ describe('createRouter', () => {
 		router.markUnhealthy('s1');
 		const snap = router.snapshot();
 		expect(snap.tenants).toHaveLength(2);
-		const byId = Object.fromEntries(snap.shards.map((shard) => [shard.id, shard]));
+		const byId = Object.fromEntries(
+			snap.shards.map((shard) => [shard.id, shard])
+		);
 		expect(byId.s0!.healthy).toBe(true);
 		expect(byId.s1!.healthy).toBe(false);
 	});
@@ -254,7 +283,10 @@ describe('createRouter', () => {
 		for (let i = 0; i < 200; i++) {
 			const tenant = `tenant-${i}`;
 			const result = router.route({ tenantId: tenant });
-			if (result.shard!.id === 's1') { pinned = tenant; break; }
+			if (result.shard!.id === 's1') {
+				pinned = tenant;
+				break;
+			}
 		}
 		expect(pinned).toBeDefined();
 
@@ -278,8 +310,8 @@ describe('createRouter', () => {
 			load: (id) => (id === 'B' ? 10 : 1),
 			shards: [
 				{ id: 'A', url: 'ws://a' },
-				{ id: 'B', url: 'ws://b' },
-			],
+				{ id: 'B', url: 'ws://b' }
+			]
 		});
 		const counts = { A: 0, B: 0 };
 		for (let i = 0; i < 2000; i++) {
@@ -295,14 +327,18 @@ describe('createRouter', () => {
 		const router = createRouter({
 			clock: clock.now,
 			perRouteRateLimits: {
-				expensive: { refillPerSecond: 1, tokens: 2 },
+				expensive: { refillPerSecond: 1, tokens: 2 }
 			},
 			perTenantRateLimit: { refillPerSecond: 10, tokens: 100 },
-			shards: makeShards(1),
+			shards: makeShards(1)
 		});
 		const route = 'expensive';
-		expect(router.route({ route, tenantId: 'acme' }).decision).toBe('allow');
-		expect(router.route({ route, tenantId: 'acme' }).decision).toBe('allow');
+		expect(router.route({ route, tenantId: 'acme' }).decision).toBe(
+			'allow'
+		);
+		expect(router.route({ route, tenantId: 'acme' }).decision).toBe(
+			'allow'
+		);
 		const refused = router.route({ route, tenantId: 'acme' });
 		expect(refused.decision).toBe('rate-limited');
 		expect(refused.emptiedBucket).toBe('expensive');
@@ -313,7 +349,7 @@ describe('createRouter', () => {
 	test('rate-limited result reports tenant bucket when that one drains first', () => {
 		const router = createRouter({
 			perTenantRateLimit: { refillPerSecond: 0, tokens: 1 },
-			shards: makeShards(1),
+			shards: makeShards(1)
 		});
 		expect(router.route({ tenantId: 't' }).decision).toBe('allow');
 		const refused = router.route({ tenantId: 't' });
@@ -325,7 +361,7 @@ describe('createRouter', () => {
 		const tripped = new Set<string>();
 		const router = createRouter({
 			allow: (tenant) => !tripped.has(tenant),
-			shards: makeShards(1),
+			shards: makeShards(1)
 		});
 		expect(router.route({ tenantId: 'acme' }).decision).toBe('allow');
 		tripped.add('acme');
@@ -339,10 +375,10 @@ describe('createRouter', () => {
 	test('failed bucket gates do not consume the OTHER bucket', () => {
 		const router = createRouter({
 			perRouteRateLimits: {
-				maxed: { refillPerSecond: 0, tokens: 0 },
+				maxed: { refillPerSecond: 0, tokens: 0 }
 			},
 			perTenantRateLimit: { refillPerSecond: 0, tokens: 100 },
-			shards: makeShards(1),
+			shards: makeShards(1)
 		});
 		const refused = router.route({ route: 'maxed', tenantId: 't' });
 		expect(refused.decision).toBe('rate-limited');
@@ -359,7 +395,7 @@ describe('createRouter', () => {
 			clock: () => now,
 			perRouteRateLimits: { hot: { refillPerSecond: 0, tokens: 5 } },
 			perTenantRateLimit: { refillPerSecond: 0, tokens: 10 },
-			shards: makeShards(2),
+			shards: makeShards(2)
 		});
 		// Drain some tokens.
 		router.route({ tenantId: 'acme' });
@@ -374,7 +410,7 @@ describe('createRouter', () => {
 			clock: () => now,
 			perRouteRateLimits: { hot: { refillPerSecond: 0, tokens: 5 } },
 			perTenantRateLimit: { refillPerSecond: 0, tokens: 10 },
-			shards: makeShards(2),
+			shards: makeShards(2)
 		});
 		next.restore(json);
 
@@ -392,7 +428,7 @@ describe('createRouter', () => {
 	test('snapshot tenants/routeBuckets are the persistable shape (arrays)', () => {
 		const router = createRouter({
 			perTenantRateLimit: { refillPerSecond: 0, tokens: 5 },
-			shards: makeShards(1),
+			shards: makeShards(1)
 		});
 		router.route({ tenantId: 'a' });
 		router.route({ tenantId: 'b' });

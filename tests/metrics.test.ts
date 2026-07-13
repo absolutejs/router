@@ -18,6 +18,7 @@ describe('router.metrics() — 0.2.0', () => {
 				'rate-limited': 0,
 				capped: 0,
 				denied: 0,
+				'no-region-shards': 0,
 				'no-shards': 0
 			},
 			routes: 0,

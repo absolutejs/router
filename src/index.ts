@@ -20,6 +20,11 @@ import {
 	type TracerProvider
 } from '@absolutejs/telemetry';
 
+// 0.4.0: region directory (gap 5.1) + custom-domain map (gap 5.6) ship as
+// sibling primitives alongside createRouter.
+export * from './region';
+export * from './domain';
+
 export type Shard = {
 	id: string;
 	/**
@@ -33,6 +38,14 @@ export type Shard = {
 	 * hash ignores weights — every shard is treated as weight 1. Default 1.
 	 */
 	weight?: number;
+	/**
+	 * Region this shard serves (matches a `Region.id` in the paired
+	 * `createRegionDirectory`). When `route()` is called with a `region`,
+	 * only shards in that region — plus region-less shards, for
+	 * back-compat — are candidates. Omit for a single-region deployment.
+	 * Added in 0.4.0.
+	 */
+	region?: string;
 };
 
 /**
@@ -41,7 +54,10 @@ export type Shard = {
  * the chosen shard. The router never calls a strategy with an empty `shards`
  * array — that case is handled upstream as `no-shards`.
  */
-export type HashStrategyFn = (key: string, shards: ReadonlyArray<Shard>) => number;
+export type HashStrategyFn = (
+	key: string,
+	shards: ReadonlyArray<Shard>
+) => number;
 
 export type HashStrategy = 'jump' | 'rendezvous' | HashStrategyFn;
 
@@ -123,6 +139,7 @@ export type RouteDecision =
 	| 'rate-limited'
 	| 'capped'
 	| 'no-shards'
+	| 'no-region-shards'
 	| 'denied';
 
 /**
@@ -168,6 +185,16 @@ export type RouteRequest = {
 	 * bucket applies).
 	 */
 	route?: string;
+	/**
+	 * Optional region filter. When set, only shards whose `region` matches
+	 * — plus region-less shards, for back-compat — are candidates. When
+	 * the region has eligible shards registered but none are candidates,
+	 * `route()` returns `'no-region-shards'` (distinguishable from the
+	 * cluster-wide `'no-shards'`). The intended source is the paired
+	 * directory: `route({ tenantId, region: directory.regionFor(tenantId) })`.
+	 * Added in 0.4.0.
+	 */
+	region?: string;
 };
 
 export type RouteResult = {
@@ -191,7 +218,9 @@ export type AcquireHandle = {
 export type RouterSnapshot = {
 	version: 1;
 	at: number;
-	shards: Array<Shard & { healthy: boolean; draining: boolean; active: number }>;
+	shards: Array<
+		Shard & { healthy: boolean; draining: boolean; active: number }
+	>;
 	tenants: Array<{
 		tenant: string;
 		active: number;
@@ -274,29 +303,35 @@ const jumpHash = (key: string, numBuckets: number): number => {
 	return Number(b);
 };
 
-const jumpStrategy: HashStrategyFn = (key, shards) => jumpHash(key, shards.length);
+const jumpStrategy: HashStrategyFn = (key, shards) =>
+	jumpHash(key, shards.length);
 
-const makeRendezvousStrategy = (load?: ShardLoadFn): HashStrategyFn => (key, shards) => {
-	let bestIndex = 0;
-	let bestScore = -Infinity;
-	for (let i = 0; i < shards.length; i++) {
-		const shard = shards[i]!;
-		const baseWeight = shard.weight ?? 1;
-		if (baseWeight <= 0) continue;
-		const loadValue = load ? Math.max(load(shard.id), 0.0001) : 1;
-		const effectiveWeight = baseWeight / loadValue;
-		const seed = fnv1a32(`${key}|${shard.id}`);
-		const u = (seed + 1) / 0x1_0000_0000;
-		const score = effectiveWeight * -Math.log(u);
-		if (score > bestScore) {
-			bestScore = score;
-			bestIndex = i;
+const makeRendezvousStrategy =
+	(load?: ShardLoadFn): HashStrategyFn =>
+	(key, shards) => {
+		let bestIndex = 0;
+		let bestScore = -Infinity;
+		for (let i = 0; i < shards.length; i++) {
+			const shard = shards[i]!;
+			const baseWeight = shard.weight ?? 1;
+			if (baseWeight <= 0) continue;
+			const loadValue = load ? Math.max(load(shard.id), 0.0001) : 1;
+			const effectiveWeight = baseWeight / loadValue;
+			const seed = fnv1a32(`${key}|${shard.id}`);
+			const u = (seed + 1) / 0x1_0000_0000;
+			const score = effectiveWeight * -Math.log(u);
+			if (score > bestScore) {
+				bestScore = score;
+				bestIndex = i;
+			}
 		}
-	}
-	return bestIndex;
-};
+		return bestIndex;
+	};
 
-const resolveStrategy = (strategy: HashStrategy, load?: ShardLoadFn): HashStrategyFn => {
+const resolveStrategy = (
+	strategy: HashStrategy,
+	load?: ShardLoadFn
+): HashStrategyFn => {
 	if (strategy === 'jump') return jumpStrategy;
 	if (strategy === 'rendezvous') return makeRendezvousStrategy(load);
 	return strategy;
@@ -318,9 +353,15 @@ type TenantState = {
 
 export const createRouter = (options: RouterOptions): Router => {
 	const clock = options.clock ?? Date.now;
-	const strategy = resolveStrategy(options.hashStrategy ?? 'jump', options.load);
+	const strategy = resolveStrategy(
+		options.hashStrategy ?? 'jump',
+		options.load
+	);
 	const cap = options.perTenantConnectionCap ?? Infinity;
-	const rate = options.perTenantRateLimit ?? { refillPerSecond: 0, tokens: Infinity };
+	const rate = options.perTenantRateLimit ?? {
+		refillPerSecond: 0,
+		tokens: Infinity
+	};
 	const perRouteRateLimits = options.perRouteRateLimits ?? {};
 	const allowHook = options.allow;
 
@@ -345,20 +386,18 @@ export const createRouter = (options: RouterOptions): Router => {
 	let totalRoutes = 0;
 	let totalAcquires = 0;
 	let lastRouteMs = 0;
-	const rejectsByDecision: Record<
-		Exclude<RouteDecision, 'allow'>,
-		number
-	> = {
+	const rejectsByDecision: Record<Exclude<RouteDecision, 'allow'>, number> = {
 		'rate-limited': 0,
-		'capped': 0,
+		capped: 0,
 		'no-shards': 0,
-		'denied': 0
+		'no-region-shards': 0,
+		denied: 0
 	};
 	const shardLoadByShard = new Map<string, number>();
 
 	const freshTenant = (now: number): TenantState => ({
 		active: 0,
-		bucket: { lastRefillAt: now, tokens: rate.tokens },
+		bucket: { lastRefillAt: now, tokens: rate.tokens }
 	});
 
 	const ensureTenant = (id: string, now: number): TenantState => {
@@ -378,7 +417,12 @@ export const createRouter = (options: RouterOptions): Router => {
 		bucket.lastRefillAt = now;
 	};
 
-	const ensureRouteBucket = (tenant: string, route: string, rule: RateLimit, now: number): Bucket => {
+	const ensureRouteBucket = (
+		tenant: string,
+		route: string,
+		rule: RateLimit,
+		now: number
+	): Bucket => {
 		const key = `${tenant}|${route}`;
 		const found = routeBuckets.get(key);
 		if (found) return found;
@@ -388,7 +432,9 @@ export const createRouter = (options: RouterOptions): Router => {
 	};
 
 	const eligibleShards = (): Shard[] =>
-		shardList.filter((shard) => healthy.get(shard.id) === true && !draining.has(shard.id));
+		shardList.filter(
+			(shard) => healthy.get(shard.id) === true && !draining.has(shard.id)
+		);
 
 	const route: Router['route'] = (request) => {
 		// 0.3.0: span the routing decision. Hot-path safe — when no
@@ -399,6 +445,9 @@ export const createRouter = (options: RouterOptions): Router => {
 				[ABS_ATTRS.tenant]: request.tenantId,
 				...(request.route !== undefined
 					? { 'abs.route.name': request.route }
+					: {}),
+				...(request.region !== undefined
+					? { 'abs.region': request.region }
 					: {})
 			}
 		});
@@ -427,6 +476,20 @@ export const createRouter = (options: RouterOptions): Router => {
 		const live = eligibleShards();
 		if (live.length === 0) return recordRejection('no-shards');
 
+		// 0.4.0: region filter. Region-less shards are region-agnostic
+		// (back-compat) and remain candidates for any requested region.
+		const candidates =
+			request.region === undefined
+				? live
+				: live.filter(
+						(shard) =>
+							shard.region === undefined ||
+							shard.region === request.region
+					);
+		if (candidates.length === 0) {
+			return recordRejection('no-region-shards');
+		}
+
 		if (allowHook && !allowHook(request.tenantId)) {
 			return recordRejection('denied');
 		}
@@ -451,9 +514,17 @@ export const createRouter = (options: RouterOptions): Router => {
 
 		let routeBucket: Bucket | null = null;
 		let routeRule: RateLimit | null = null;
-		if (request.route !== undefined && perRouteRateLimits[request.route] !== undefined) {
+		if (
+			request.route !== undefined &&
+			perRouteRateLimits[request.route] !== undefined
+		) {
 			routeRule = perRouteRateLimits[request.route]!;
-			routeBucket = ensureRouteBucket(request.tenantId, request.route, routeRule, now);
+			routeBucket = ensureRouteBucket(
+				request.tenantId,
+				request.route,
+				routeRule,
+				now
+			);
 			refillBucket(routeBucket, routeRule, now);
 			if (routeBucket.tokens < 1) {
 				rejectsByDecision['rate-limited'] += 1;
@@ -470,11 +541,13 @@ export const createRouter = (options: RouterOptions): Router => {
 		state.bucket.tokens -= 1;
 		if (routeBucket) routeBucket.tokens -= 1;
 
-		const key = request.channelId === undefined
-			? request.tenantId
-			: `${request.tenantId}:${request.channelId}`;
-		const index = strategy(key, live);
-		const chosen = live[Math.max(0, Math.min(index, live.length - 1))]!;
+		const key =
+			request.channelId === undefined
+				? request.tenantId
+				: `${request.tenantId}:${request.channelId}`;
+		const index = strategy(key, candidates);
+		const chosen =
+			candidates[Math.max(0, Math.min(index, candidates.length - 1))]!;
 		shardLoadByShard.set(
 			chosen.id,
 			(shardLoadByShard.get(chosen.id) ?? 0) + 1
@@ -506,7 +579,7 @@ export const createRouter = (options: RouterOptions): Router => {
 				released = true;
 				const current = tenants.get(tenantId);
 				if (current && current.active > 0) current.active -= 1;
-			},
+			}
 		};
 	};
 
@@ -562,7 +635,7 @@ export const createRouter = (options: RouterOptions): Router => {
 					active: state.active,
 					lastRefillAt: state.bucket.lastRefillAt,
 					tenant,
-					tokens: state.bucket.tokens,
+					tokens: state.bucket.tokens
 				});
 			}
 			const routesOut: RouterSnapshot['routeBuckets'] = [];
@@ -573,23 +646,26 @@ export const createRouter = (options: RouterOptions): Router => {
 					lastRefillAt: bucket.lastRefillAt,
 					route: key.slice(pipe + 1),
 					tenant: key.slice(0, pipe),
-					tokens: bucket.tokens,
+					tokens: bucket.tokens
 				});
 			}
 			return {
 				at: now,
 				routeBuckets: routesOut,
 				shards: shardList.map((shard) => {
-					const active = Array.from(tenants.values()).reduce((acc, state) => acc + state.active, 0);
+					const active = Array.from(tenants.values()).reduce(
+						(acc, state) => acc + state.active,
+						0
+					);
 					return {
 						...shard,
 						active,
 						draining: draining.has(shard.id),
-						healthy: healthy.get(shard.id) === true,
+						healthy: healthy.get(shard.id) === true
 					};
 				}),
 				tenants: tenantsOut,
-				version: 1,
+				version: 1
 			};
 		},
 		restore: (snap) => {
@@ -599,19 +675,19 @@ export const createRouter = (options: RouterOptions): Router => {
 			for (const t of snap.tenants) {
 				tenants.set(t.tenant, {
 					active: t.active,
-					bucket: { lastRefillAt: t.lastRefillAt, tokens: t.tokens },
+					bucket: { lastRefillAt: t.lastRefillAt, tokens: t.tokens }
 				});
 			}
 			for (const r of snap.routeBuckets) {
 				routeBuckets.set(`${r.tenant}|${r.route}`, {
 					lastRefillAt: r.lastRefillAt,
-					tokens: r.tokens,
+					tokens: r.tokens
 				});
 			}
 			for (const shard of snap.shards) {
 				healthy.set(shard.id, shard.healthy);
 				if (shard.draining) draining.add(shard.id);
 			}
-		},
+		}
 	};
 };

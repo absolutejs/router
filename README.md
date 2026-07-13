@@ -18,39 +18,43 @@ return a 503). An Elysia adapter ships in a later 0.0.x as a subpath.
 import { createRouter } from '@absolutejs/router';
 
 const router = createRouter({
-  shards: [
-    { id: 'engine-1', url: 'ws://10.0.0.11:3000' },
-    { id: 'engine-2', url: 'ws://10.0.0.12:3000' },
-  ],
-  hashStrategy: 'jump',
-  perTenantConnectionCap: 100,
-  perTenantRateLimit: { tokens: 100, refillPerSecond: 10 },
+	shards: [
+		{ id: 'engine-1', url: 'ws://10.0.0.11:3000' },
+		{ id: 'engine-2', url: 'ws://10.0.0.12:3000' }
+	],
+	hashStrategy: 'jump',
+	perTenantConnectionCap: 100,
+	perTenantRateLimit: { tokens: 100, refillPerSecond: 10 }
 });
 
 // In your WS upgrade handler:
 const decision = router.route({ tenantId, channelId });
 if (decision.decision !== 'allow') {
-  return new Response(decision.decision, { status: 429 });
+	return new Response(decision.decision, { status: 429 });
 }
 const handle = router.acquire(tenantId);
-ws.data = { ...ws.data, release: handle.release, upstream: decision.shard!.url };
+ws.data = {
+	...ws.data,
+	release: handle.release,
+	upstream: decision.shard!.url
+};
 // ...proxy WS frames to decision.shard.url; call handle.release() on close.
 ```
 
 ## Surface (0.1.0)
 
-| API | Purpose |
-|---|---|
-| `createRouter(options)` | Factory. Returns a `Router`. |
-| `router.route({ tenantId, channelId?, route? })` | Returns `{ shard, decision, emptiedBucket? }`. Decision is `allow` / `rate-limited` / `capped` / `no-shards` / `denied`. |
-| `router.acquire(tenantId)` | Increment active-connection counter; returns `{ active, release }`. `release` is idempotent. |
-| `router.markHealthy(id)` / `router.markUnhealthy(id)` | Caller-driven health state. Unhealthy shards are skipped. |
-| `router.drainShard(id)` | Refuse new routes; existing acquires unaffected. Operator-intentional state distinct from unhealthy. `markHealthy` cancels it. |
-| `router.isHealthy(id)` / `router.isDraining(id)` | Inspect state. |
-| `router.addShard(shard)` / `router.removeShard(id)` | Runtime shard membership changes. |
-| `router.shards()` | Inspect shard list. |
-| `router.snapshot()` / `router.restore(snap)` | Serializable point-in-time state. Survive edge restarts without dropping rate-limit tokens. |
-| `router.dispose()` | Stop accepting routes; all subsequent `route()` returns `no-shards`. |
+| API                                                       | Purpose                                                                                                                                       |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createRouter(options)`                                   | Factory. Returns a `Router`.                                                                                                                  |
+| `router.route({ tenantId, channelId?, route?, region? })` | Returns `{ shard, decision, emptiedBucket? }`. Decision is `allow` / `rate-limited` / `capped` / `no-shards` / `no-region-shards` / `denied`. |
+| `router.acquire(tenantId)`                                | Increment active-connection counter; returns `{ active, release }`. `release` is idempotent.                                                  |
+| `router.markHealthy(id)` / `router.markUnhealthy(id)`     | Caller-driven health state. Unhealthy shards are skipped.                                                                                     |
+| `router.drainShard(id)`                                   | Refuse new routes; existing acquires unaffected. Operator-intentional state distinct from unhealthy. `markHealthy` cancels it.                |
+| `router.isHealthy(id)` / `router.isDraining(id)`          | Inspect state.                                                                                                                                |
+| `router.addShard(shard)` / `router.removeShard(id)`       | Runtime shard membership changes.                                                                                                             |
+| `router.shards()`                                         | Inspect shard list.                                                                                                                           |
+| `router.snapshot()` / `router.restore(snap)`              | Serializable point-in-time state. Survive edge restarts without dropping rate-limit tokens.                                                   |
+| `router.dispose()`                                        | Stop accepting routes; all subsequent `route()` returns `no-shards`.                                                                          |
 
 ### Hash strategies + load bias
 
@@ -105,12 +109,106 @@ restored.restore(JSON.parse(await readFromDisk('/var/lib/router/state.json')));
 
 Captures rate-limit token counts, per-route bucket state, shard health + drain state, per-tenant active connection counts. Without this, an edge restart hands every tenant a fresh full bucket — instant rate-limit-bypass for anyone watching the deploy times.
 
+## Region-aware routing (0.4.0)
+
+`createRouter` shards WITHIN a region; `createRegionDirectory` decides which
+region a tenant lives in. Sticky, deterministic assignment — weighted
+rendezvous over region ids by default, so every replica computes the same
+answer without coordination — plus an optional caller hook for latency-based
+placement and explicit overrides for control-plane onboarding decisions.
+
+```ts
+import { createRegionDirectory, createRouter } from '@absolutejs/router';
+
+const directory = createRegionDirectory({
+	regions: [
+		{ id: 'us-east', weight: 2 }, // twice the tenants of eu-west
+		{ id: 'eu-west' }
+	],
+	// Optional: latency-based placement. Return undefined to fall back to
+	// the default weighted-rendezvous strategy.
+	assign: (tenantId) => edgeProbe.closestRegion(tenantId)
+});
+
+const router = createRouter({
+	shards: [
+		{ id: 'us-1', url: 'ws://10.0.0.11:3000', region: 'us-east' },
+		{ id: 'us-2', url: 'ws://10.0.0.12:3000', region: 'us-east' },
+		{ id: 'eu-1', url: 'ws://10.1.0.11:3000', region: 'eu-west' }
+	]
+});
+
+// The wire-up: the directory picks the region, the router picks the shard.
+const decision = router.route({
+	tenantId,
+	region: directory.regionFor(tenantId)
+});
+```
+
+| API                                                                    | Purpose                                                                                |
+| ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `createRegionDirectory({ regions, assign?, clock?, tracerProvider? })` | Factory. At least one region required.                                                 |
+| `directory.regionFor(tenantId)`                                        | Sticky assignment, created on first call. Re-assigns lazily if the region was removed. |
+| `directory.assignRegion(tenantId, regionId)`                           | Explicit override (control-plane onboarding). Throws on unknown region.                |
+| `directory.release(tenantId)`                                          | Forget the assignment; next `regionFor` re-assigns.                                    |
+| `directory.addRegion(region)` / `directory.removeRegion(id)`           | Runtime region membership. Removal re-assigns its tenants lazily.                      |
+| `directory.regions()`                                                  | Inspect the region list.                                                               |
+| `directory.snapshot()` / `directory.restore(snap)`                     | Assignments (+ override flags) survive control-plane restarts.                         |
+| `directory.metrics()`                                                  | `{ assignments, byRegion, overrides }`.                                                |
+
+Shards without a `region` are region-agnostic — they remain candidates for
+ANY requested region (back-compat: an existing single-region deployment keeps
+working untouched). A `route({ region })` with no candidate shards in that
+region returns `decision: 'no-region-shards'` — distinguishable from the
+cluster-wide `no-shards` in `metrics().rejectsByDecision`, so "region drained"
+and "cluster empty" alert separately.
+
+## Custom-domain map (0.4.0)
+
+A tenant's traffic arrives as `app.acme.com` (their CNAME), not as a tenant
+id. `createDomainMap` is the first lookup in the edge gateway: hostname →
+tenant, dependency-free and O(1)-ish (a Map for exact hosts, a Map keyed by
+suffix for wildcards).
+
+```ts
+import { createDomainMap } from '@absolutejs/router';
+
+const domainMap = createDomainMap({
+	// Resolver of last resort — the platform's own subdomain scheme.
+	fallback: (host) =>
+		host.endsWith('.cloud.absolutejs.com')
+			? host.slice(0, -'.cloud.absolutejs.com'.length)
+			: undefined
+});
+
+domainMap.add('app.acme.com', 'acme'); // exact custom domain
+domainMap.add('*.acme.com', 'acme'); // wildcard — exactly one label deep
+
+// Edge gateway: host header → tenant → region → shard.
+const hit = domainMap.resolve(request.headers.get('host') ?? '');
+if (!hit) return new Response('unknown domain', { status: 404 });
+const decision = router.route({
+	tenantId: hit.tenantId,
+	region: directory.regionFor(hit.tenantId)
+});
+```
+
+| API                                                       | Purpose                                                                                                                                       |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createDomainMap({ fallback?, clock?, tracerProvider? })` | Factory.                                                                                                                                      |
+| `map.add(hostname, tenantId)`                             | Lowercases. Exact hosts and `*.example.com` wildcards (one label depth — TLS-wildcard-certificate scoping). Throws on other `*` placements.   |
+| `map.remove(hostname)`                                    | Delete an entry (exact or `*.` form).                                                                                                         |
+| `map.resolve(hostname)`                                   | `{ tenantId, matched: 'exact' \| 'wildcard' \| 'fallback' } \| null`. Strips port, lowercases. Exact beats wildcard beats fallback.           |
+| `map.list()`                                              | Every entry; wildcards in their `*.` form.                                                                                                    |
+| `map.snapshot()` / `map.restore(snap)`                    | Entries survive edge restarts.                                                                                                                |
+| `map.metrics()`                                           | `{ entries, resolves, hits, misses, lastResolveMs }`. A climbing miss rate usually means stale DNS pointing at the gateway after an offboard. |
+
 ## Architectural role
 
 - **`@absolutejs/sync`** — the engine each backend shard runs.
 - **`@absolutejs/runtime`** — the process pool each backend shard spawns from.
 - **`@absolutejs/metering`** — counts the bill; `meter.allow(tenant)` reads.
-- **`@absolutejs/router`** — *this library*. The edge decision before traffic reaches a shard. `meter.allow()` can be wired into the gateway alongside `router.route()` to refuse over-quota tenants without paying for the upstream hop.
+- **`@absolutejs/router`** — _this library_. The edge decision before traffic reaches a shard. `meter.allow()` can be wired into the gateway alongside `router.route()` to refuse over-quota tenants without paying for the upstream hop.
 
 ## What v0.0.1 does NOT include
 
