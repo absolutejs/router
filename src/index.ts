@@ -34,6 +34,12 @@ export type Shard = {
 	 */
 	url: string;
 	/**
+	 * Optional tenant allowlist for dedicated runtimes. When present, this
+	 * shard is eligible only for the listed tenant ids. Omit for shared shard
+	 * hosts that can serve any tenant.
+	 */
+	tenants?: readonly string[];
+	/**
 	 * Relative weight for hash strategies that support it (rendezvous). Jump
 	 * hash ignores weights — every shard is treated as weight 1. Default 1.
 	 */
@@ -139,6 +145,7 @@ export type RouteDecision =
 	| 'rate-limited'
 	| 'capped'
 	| 'no-shards'
+	| 'no-tenant-shards'
 	| 'no-region-shards'
 	| 'denied';
 
@@ -255,7 +262,10 @@ export type Router = {
 	removeShard: (shardId: string) => void;
 	shards: () => Shard[];
 	snapshot: () => RouterSnapshot;
-	restore: (snapshot: RouterSnapshot) => void;
+	restore: (
+		snapshot: RouterSnapshot,
+		options?: { resetConnections?: boolean }
+	) => void;
 	/**
 	 * Operator-shaped point-in-time + cumulative metrics since
 	 * `createRouter()`. Use for tier dashboards and "where am I
@@ -390,6 +400,7 @@ export const createRouter = (options: RouterOptions): Router => {
 		'rate-limited': 0,
 		capped: 0,
 		'no-shards': 0,
+		'no-tenant-shards': 0,
 		'no-region-shards': 0,
 		denied: 0
 	};
@@ -475,13 +486,20 @@ export const createRouter = (options: RouterOptions): Router => {
 
 		const live = eligibleShards();
 		if (live.length === 0) return recordRejection('no-shards');
+		const tenantShards = live.filter(
+			(shard) =>
+				shard.tenants === undefined ||
+				shard.tenants.includes(request.tenantId)
+		);
+		if (tenantShards.length === 0)
+			return recordRejection('no-tenant-shards');
 
 		// 0.4.0: region filter. Region-less shards are region-agnostic
 		// (back-compat) and remain candidates for any requested region.
 		const candidates =
 			request.region === undefined
-				? live
-				: live.filter(
+				? tenantShards
+				: tenantShards.filter(
 						(shard) =>
 							shard.region === undefined ||
 							shard.region === request.region
@@ -668,13 +686,13 @@ export const createRouter = (options: RouterOptions): Router => {
 				version: 1
 			};
 		},
-		restore: (snap) => {
+		restore: (snap, restoreOptions) => {
 			tenants.clear();
 			routeBuckets.clear();
 			draining.clear();
 			for (const t of snap.tenants) {
 				tenants.set(t.tenant, {
-					active: t.active,
+					active: restoreOptions?.resetConnections ? 0 : t.active,
 					bucket: { lastRefillAt: t.lastRefillAt, tokens: t.tokens }
 				});
 			}

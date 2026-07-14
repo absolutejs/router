@@ -21,6 +21,39 @@ const makeShards = (n: number): Shard[] =>
 	}));
 
 describe('createRouter', () => {
+	test('tenant-affine shards never receive another tenant', () => {
+		const router = createRouter({
+			shards: [
+				{ id: 'alpha-only', tenants: ['alpha'], url: 'http://alpha' },
+				{ id: 'beta-only', tenants: ['beta'], url: 'http://beta' }
+			]
+		});
+
+		expect(router.route({ tenantId: 'alpha' })).toMatchObject({
+			decision: 'allow',
+			shard: { id: 'alpha-only' }
+		});
+		expect(router.route({ tenantId: 'beta' })).toMatchObject({
+			decision: 'allow',
+			shard: { id: 'beta-only' }
+		});
+		expect(router.route({ tenantId: 'gamma' })).toEqual({
+			decision: 'no-tenant-shards',
+			shard: null
+		});
+	});
+
+	test('shared shards remain eligible alongside tenant-affine shards', () => {
+		const router = createRouter({
+			shards: [
+				{ id: 'alpha-only', tenants: ['alpha'], url: 'http://alpha' },
+				{ id: 'shared', url: 'http://shared' }
+			]
+		});
+
+		expect(router.route({ tenantId: 'gamma' }).shard?.id).toBe('shared');
+	});
+
 	test('returns no-shards when nothing is registered', () => {
 		const router = createRouter({ shards: [] });
 		const result = router.route({ tenantId: 't1' });
@@ -436,5 +469,22 @@ describe('createRouter', () => {
 		expect(Array.isArray(snap.tenants)).toBe(true);
 		expect(Array.isArray(snap.routeBuckets)).toBe(true);
 		expect(snap.tenants).toHaveLength(2);
+	});
+
+	test('restore can reset connection counts after a gateway restart', () => {
+		const router = createRouter({
+			perTenantConnectionCap: 1,
+			shards: makeShards(1)
+		});
+		router.acquire('acme');
+		const snapshot = router.snapshot();
+		const restored = createRouter({
+			perTenantConnectionCap: 1,
+			shards: makeShards(1)
+		});
+
+		restored.restore(snapshot, { resetConnections: true });
+
+		expect(restored.route({ tenantId: 'acme' }).decision).toBe('allow');
 	});
 });

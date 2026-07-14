@@ -1,6 +1,6 @@
 {
 	"name": "@absolutejs/router",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"description": "Multi-tenant connection routing primitive for Bun PaaS gateways. Consistent-hash tenant→shard, per-tenant connection cap, per-tenant rate limit, healthy-shard skip. The library that goes in front of N @absolutejs/runtime instances.",
 	"repository": {
 		"type": "git",
@@ -30,7 +30,7 @@
 		"websocket"
 	],
 	"scripts": {
-		"build": "rm -rf dist && bun build src/index.ts --outdir dist --sourcemap --target=bun && tsc --project tsconfig.build.json",
+		"build": "rm -rf dist && bun build src/index.ts src/bun.ts --outdir dist --sourcemap --target=bun && tsc --project tsconfig.build.json",
 		"test": "bun test tests/",
 		"typecheck": "tsc --noEmit",
 		"format": "prettier --write \"./**/*.{ts,json,md}\"",
@@ -38,13 +38,12 @@
 		"release": "bun run format && bun run check:package && bun publish"
 	},
 	"dependencies": {
-		"@absolutejs/telemetry": "^0.0.2"
+		"@absolutejs/telemetry": "^0.1.1"
 	},
 	"peerDependencies": {
 		"bun-types": "^1.3.14"
 	},
 	"devDependencies": {
-		"@absolutejs/telemetry": "^0.0.2",
 		"@types/bun": "^1.3.14",
 		"prettier": "^3.8.3",
 		"typescript": "^6.0.3"
@@ -54,6 +53,11 @@
 			"types": "./dist/index.d.ts",
 			"import": "./dist/index.js",
 			"default": "./dist/index.js"
+		},
+		"./bun": {
+			"types": "./dist/bun.d.ts",
+			"import": "./dist/bun.js",
+			"default": "./dist/bun.js"
 		}
 	},
 	"files": [

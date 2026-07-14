@@ -10,9 +10,30 @@ for a subset of tenants) and decides — per request:
 3. Is the tenant over its rate limit?
 4. Is the chosen shard healthy?
 
-Pure logic, zero Bun / Elysia surface. Wire `router.route(...)` into whichever
-HTTP/WS layer you have (Bun.serve, Elysia, native node:http, anything that can
-return a 503). An Elysia adapter ships in a later 0.0.x as a subpath.
+The core remains transport-independent. For Bun, the `/bun` subpath provides
+streaming HTTP proxying and a bidirectional WebSocket bridge while holding the
+router acquire handle for the real request/socket lifetime.
+
+```ts
+import { createBunGateway } from '@absolutejs/router/bun';
+
+const gateway = createBunGateway({
+	router,
+	resolve: (request) => {
+		const hit = domainMap.resolve(request.headers.get('host') ?? '');
+
+		return hit
+			? { route: new URL(request.url).pathname, tenantId: hit.tenantId }
+			: null;
+	}
+});
+
+Bun.serve({ port: 3001, ...gateway });
+```
+
+Dedicated runtimes register shards with `tenants: [tenantId]`; shared shard
+hosts omit `tenants`. A request without an eligible dedicated/shared shard
+fails closed with `no-tenant-shards`.
 
 ```ts
 import { createRouter } from '@absolutejs/router';
@@ -43,18 +64,19 @@ ws.data = {
 
 ## Surface (0.1.0)
 
-| API                                                       | Purpose                                                                                                                                       |
-| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `createRouter(options)`                                   | Factory. Returns a `Router`.                                                                                                                  |
-| `router.route({ tenantId, channelId?, route?, region? })` | Returns `{ shard, decision, emptiedBucket? }`. Decision is `allow` / `rate-limited` / `capped` / `no-shards` / `no-region-shards` / `denied`. |
-| `router.acquire(tenantId)`                                | Increment active-connection counter; returns `{ active, release }`. `release` is idempotent.                                                  |
-| `router.markHealthy(id)` / `router.markUnhealthy(id)`     | Caller-driven health state. Unhealthy shards are skipped.                                                                                     |
-| `router.drainShard(id)`                                   | Refuse new routes; existing acquires unaffected. Operator-intentional state distinct from unhealthy. `markHealthy` cancels it.                |
-| `router.isHealthy(id)` / `router.isDraining(id)`          | Inspect state.                                                                                                                                |
-| `router.addShard(shard)` / `router.removeShard(id)`       | Runtime shard membership changes.                                                                                                             |
-| `router.shards()`                                         | Inspect shard list.                                                                                                                           |
-| `router.snapshot()` / `router.restore(snap)`              | Serializable point-in-time state. Survive edge restarts without dropping rate-limit tokens.                                                   |
-| `router.dispose()`                                        | Stop accepting routes; all subsequent `route()` returns `no-shards`.                                                                          |
+| API                                                       | Purpose                                                                                                                                                            |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `createRouter(options)`                                   | Factory. Returns a `Router`.                                                                                                                                       |
+| `router.route({ tenantId, channelId?, route?, region? })` | Returns `{ shard, decision, emptiedBucket? }`. Decision is `allow` / `rate-limited` / `capped` / `no-shards` / `no-tenant-shards` / `no-region-shards` / `denied`. |
+| `router.acquire(tenantId)`                                | Increment active-connection counter; returns `{ active, release }`. `release` is idempotent.                                                                       |
+| `router.markHealthy(id)` / `router.markUnhealthy(id)`     | Caller-driven health state. Unhealthy shards are skipped.                                                                                                          |
+| `router.drainShard(id)`                                   | Refuse new routes; existing acquires unaffected. Operator-intentional state distinct from unhealthy. `markHealthy` cancels it.                                     |
+| `router.isHealthy(id)` / `router.isDraining(id)`          | Inspect state.                                                                                                                                                     |
+| `router.addShard(shard)` / `router.removeShard(id)`       | Runtime shard membership changes.                                                                                                                                  |
+| `router.shards()`                                         | Inspect shard list.                                                                                                                                                |
+| `router.snapshot()` / `router.restore(snap, options?)`    | Serializable state. `resetConnections` preserves rate-limit tokens while clearing dead connections after an edge restart.                                          |
+| `createBunGateway(options)` (`/bun`)                      | Bun HTTP/WebSocket proxy adapter with admission lifetime, forwarding headers, protocol bridging, and decision status mapping.                                      |
+| `router.dispose()`                                        | Stop accepting routes; all subsequent `route()` returns `no-shards`.                                                                                               |
 
 ### Hash strategies + load bias
 
