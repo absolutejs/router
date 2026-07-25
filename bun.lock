@@ -5,7 +5,7 @@
     "": {
       "name": "@absolutejs/router",
       "dependencies": {
-        "@absolutejs/telemetry": "^0.1.1",
+        "@absolutejs/telemetry": "^0.2.0",
       },
       "devDependencies": {
         "@types/bun": "^1.3.14",
@@ -15,7 +15,7 @@
     },
   },
   "packages": {
-    "@absolutejs/telemetry": ["@absolutejs/telemetry@0.1.1", "", {}, "sha512-NcwsZytPOVQSnksYVofmvdDNqIwIJLbUmAMAZD5v2gLy98JgtvEmR1kHGNIXGAZgHA4rqofQt7PZlVCCwlx2mQ=="],
+    "@absolutejs/telemetry": ["@absolutejs/telemetry@0.2.0", "", {}, "sha512-4Xh9lShoa1QrSvzRRjIR/5h5pqed60Wc6SLliCkoGjZd8XOtQM3tP4aKTA3LgQ22tUDmxpcZitRzuDU9dMX9Fw=="],
 
     "@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 
