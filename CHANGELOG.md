@@ -1,5 +1,9 @@
 # @absolutejs/router changelog
 
+## 0.5.3 — 2026-08-07
+
+- Accepts the shared `@absolutejs/telemetry` 0.3 runtime line.
+
 ## 0.4.0 — 2026-07-13
 
 Closes two operational gaps from the PaaS guide as backwards-compatible
