@@ -1,5 +1,61 @@
 # @absolutejs/router changelog
 
+## 0.6.0 — 2026-08-14
+
+Adds replica balancing. Through 0.5.x every strategy was a consistent hash of
+the routing key, which is correct when a shard OWNS the key's state but wrong
+when the shards are interchangeable replicas of one stateless app — all of a
+tenant's traffic pinned to a single replica no matter how many were
+registered.
+
+### Added — `balance` strategies
+
+- **`BalanceStrategy = 'sticky' | 'round-robin' | 'least-connections'`**,
+  settable as a router-wide default (`createRouter({ balance })`) and
+  overridable per call (`route({ balance })`), so one router can serve sticky
+  sync tenants and round-robin stateless replicas side by side.
+    - `'sticky'` — the 0.5.x behaviour and still the default: consistent hash
+      of the key through `hashStrategy`. For session affinity, pass a
+      per-client `channelId` — each client sticks to one replica while
+      different clients spread.
+    - `'round-robin'` — successive calls for the same key cycle the eligible
+      shards. The cursor is per routing key, so one busy tenant cannot skew
+      another tenant's spread.
+    - `'least-connections'` — picks the eligible shard with the fewest active
+      connections. Ties break round-robin, so an idle field of replicas still
+      spreads instead of collapsing onto index 0.
+- Both new strategies respect health, draining, tenant allowlists and region
+  filters exactly as `'sticky'` does, and ignore `hashStrategy` — they make no
+  cross-call stability promise.
+
+### Added — per-shard connection accounting
+
+- **`acquire(tenantId, shardId?)`** takes an optional shard id. Tagged
+  acquires maintain a live per-shard active count that `'least-connections'`
+  reads and `release()` decrements. Omitting the id keeps 0.5.x semantics: the
+  tenant cap is still enforced, the connection just stays invisible to
+  per-shard accounting.
+- **`metrics().shardActiveConnections`** — point-in-time active connections
+  per shard. The direct "is my balancing actually balancing?" signal, next to
+  the existing cumulative `shardLoadDistribution`.
+- The Bun gateway (`@absolutejs/router/bun`) now tags its acquire with the
+  chosen shard, so per-shard counts cover the whole request/socket lifetime
+  with no caller change.
+
+### Fixed
+
+- `snapshot().shards[].active` reported the cluster-wide tenant total on every
+  shard, which made it useless for spotting a hot replica. It is now that
+  shard's own active count. `restore()` repopulates the counts, and
+  `restore(snapshot, { resetConnections: true })` zeroes them alongside the
+  per-tenant ones.
+
+### Compatibility
+
+Additive. A 0.5.x caller that sets no `balance` and passes no shard id to
+`acquire()` behaves exactly as before, except that `snapshot().shards[].active`
+now reports a correct (smaller) number.
+
 ## 0.4.0 — 2026-07-13
 
 Closes two operational gaps from the PaaS guide as backwards-compatible

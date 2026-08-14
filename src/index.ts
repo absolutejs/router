@@ -68,6 +68,30 @@ export type HashStrategyFn = (
 export type HashStrategy = 'jump' | 'rendezvous' | HashStrategyFn;
 
 /**
+ * How `route()` picks among the eligible shards. Added in 0.6.0.
+ *
+ * - `'sticky'` (default, and the only 0.5.x behaviour) — consistent hash of
+ *   the routing key through `hashStrategy`. The same key always lands on the
+ *   same shard while the eligible set is unchanged. This is what you want
+ *   when a shard OWNS the key's state (a sync engine, an in-memory room) and
+ *   when you want session affinity: pass a per-client `channelId` so each
+ *   client sticks to one shard while different clients spread out.
+ * - `'round-robin'` — successive calls for the same key cycle through the
+ *   eligible shards. The counter is per routing key, so tenants rotate
+ *   independently. Use when every shard is an interchangeable REPLICA of the
+ *   same stateless app.
+ * - `'least-connections'` — picks the eligible shard with the fewest active
+ *   connections, as counted by shard-tagged `acquire()` calls. Ties break
+ *   round-robin so equal-load shards still spread. Use when request cost is
+ *   uneven and a slow request shouldn't keep attracting new ones.
+ *
+ * `'round-robin'` and `'least-connections'` deliberately ignore
+ * `hashStrategy` — they are not consistent hashes and make no stability
+ * promise across calls.
+ */
+export type BalanceStrategy = 'sticky' | 'round-robin' | 'least-connections';
+
+/**
  * Per-tenant token-bucket rate limit. `tokens` is the bucket capacity AND the
  * starting balance; `refillPerSecond` is added continuously up to capacity.
  * Defaults: `Infinity` tokens / `0` refill = no limit.
@@ -99,8 +123,14 @@ export type ShardLoadFn = (shardId: string) => number;
 export type RouterOptions = {
 	/** Initial shard set. Can be empty (every `route()` returns `no-shards`). */
 	shards: Shard[];
-	/** Hash strategy. Default `'jump'`. */
+	/** Hash strategy. Default `'jump'`. Only consulted for `'sticky'` balancing. */
 	hashStrategy?: HashStrategy;
+	/**
+	 * Default shard-selection strategy for every `route()` call that does not
+	 * override it. Default `'sticky'` — the 0.5.x behaviour. See
+	 * {@link BalanceStrategy}. Added in 0.6.0.
+	 */
+	balance?: BalanceStrategy;
 	/**
 	 * Max concurrent connections per tenant (counted via `acquire()` /
 	 * `release()`). Default `Infinity` (no cap). When reached, `route()`
@@ -160,10 +190,11 @@ export type RouteDecision =
  *   operator's "where am I shedding load?" answer.
  * - `shardLoadDistribution` — cumulative routes assigned per shard
  *   since `createRouter()`. With `markHealthy`/`drainShard` this is
- *   the "is rebalancing actually rebalancing?" signal. (Per-shard
- *   *active* connection count would require route-to-acquire
- *   correlation that the current `acquire(tenantId)` API doesn't
- *   capture; cumulative routes are the directly-observable proxy.)
+ *   the "is rebalancing actually rebalancing?" signal.
+ * - `shardActiveConnections` — point-in-time active connections per
+ *   shard, from shard-tagged `acquire()` calls. Shards acquired
+ *   without a shard id are not counted. The direct "is my balancing
+ *   actually balancing?" signal. Added in 0.6.0.
  * - `lastRouteMs` — wall-clock of the most recent `route()` call (a
  *   climb means the hot path is getting slower — usually a sign that
  *   `load:` is doing too much work, or the shard count exploded).
@@ -173,6 +204,7 @@ export type RouterMetrics = {
 	acquires: number;
 	rejectsByDecision: Record<Exclude<RouteDecision, 'allow'>, number>;
 	shardLoadDistribution: Record<string, number>;
+	shardActiveConnections: Record<string, number>;
 	lastRouteMs: number;
 };
 
@@ -202,6 +234,12 @@ export type RouteRequest = {
 	 * Added in 0.4.0.
 	 */
 	region?: string;
+	/**
+	 * Per-call override of the router's default {@link BalanceStrategy}. Lets
+	 * one router serve sticky sync tenants and round-robin stateless replicas
+	 * side by side. Added in 0.6.0.
+	 */
+	balance?: BalanceStrategy;
 };
 
 export type RouteResult = {
@@ -244,7 +282,15 @@ export type RouterSnapshot = {
 
 export type Router = {
 	route: (request: RouteRequest) => RouteResult;
-	acquire: (tenantId: string) => AcquireHandle;
+	/**
+	 * Count one active connection against the tenant's cap. Pass the id of the
+	 * shard the connection was routed to (0.6.0) so the router can maintain
+	 * per-shard active counts — `'least-connections'` balancing and
+	 * `metrics().shardActiveConnections` both read from them. Omitting it
+	 * keeps the 0.5.x behaviour: the tenant cap is enforced, but the
+	 * connection is invisible to per-shard accounting.
+	 */
+	acquire: (tenantId: string, shardId?: string) => AcquireHandle;
 	markHealthy: (shardId: string) => void;
 	markUnhealthy: (shardId: string) => void;
 	/**
@@ -367,6 +413,7 @@ export const createRouter = (options: RouterOptions): Router => {
 		options.hashStrategy ?? 'jump',
 		options.load
 	);
+	const defaultBalance: BalanceStrategy = options.balance ?? 'sticky';
 	const cap = options.perTenantConnectionCap ?? Infinity;
 	const rate = options.perTenantRateLimit ?? {
 		refillPerSecond: 0,
@@ -405,6 +452,11 @@ export const createRouter = (options: RouterOptions): Router => {
 		denied: 0
 	};
 	const shardLoadByShard = new Map<string, number>();
+	// 0.6.0: rotating cursor per routing key for 'round-robin' (and for
+	// breaking 'least-connections' ties), plus live per-shard active counts
+	// fed by shard-tagged acquire()/release().
+	const rotation = new Map<string, number>();
+	const shardActive = new Map<string, number>();
 
 	const freshTenant = (now: number): TenantState => ({
 		active: 0,
@@ -446,6 +498,54 @@ export const createRouter = (options: RouterOptions): Router => {
 		shardList.filter(
 			(shard) => healthy.get(shard.id) === true && !draining.has(shard.id)
 		);
+
+	/**
+	 * Advance and return this key's rotation cursor. Kept per routing key so
+	 * one busy tenant can't skew another tenant's spread.
+	 */
+	const nextRotation = (key: string) => {
+		const next = (rotation.get(key) ?? 0) + 1;
+		// Wrap well below MAX_SAFE_INTEGER so a long-lived process never
+		// reaches a float-precision plateau where `% length` stops moving.
+		rotation.set(key, next % 0x7fffffff);
+
+		return next;
+	};
+
+	/**
+	 * Pick a shard from `candidates` (already filtered to eligible + tenant +
+	 * region) under the effective balance strategy. Never called with an empty
+	 * `candidates` array.
+	 */
+	const selectShard = (
+		key: string,
+		candidates: ReadonlyArray<Shard>,
+		balance: BalanceStrategy
+	): Shard => {
+		if (balance === 'round-robin')
+			return candidates[nextRotation(key) % candidates.length]!;
+		if (balance === 'least-connections') {
+			// Start the scan at the rotation cursor so a field of equally
+			// loaded shards (the common case at low traffic) still spreads
+			// instead of always resolving to index 0.
+			const offset = nextRotation(key);
+			let best = candidates[offset % candidates.length]!;
+			let bestActive = shardActive.get(best.id) ?? 0;
+			for (let step = 1; step < candidates.length; step++) {
+				const shard = candidates[(offset + step) % candidates.length]!;
+				const active = shardActive.get(shard.id) ?? 0;
+				if (active < bestActive) {
+					best = shard;
+					bestActive = active;
+				}
+			}
+
+			return best;
+		}
+		const index = strategy(key, candidates);
+
+		return candidates[Math.max(0, Math.min(index, candidates.length - 1))]!;
+	};
 
 	const route: Router['route'] = (request) => {
 		// 0.3.0: span the routing decision. Hot-path safe — when no
@@ -563,9 +663,11 @@ export const createRouter = (options: RouterOptions): Router => {
 			request.channelId === undefined
 				? request.tenantId
 				: `${request.tenantId}:${request.channelId}`;
-		const index = strategy(key, candidates);
-		const chosen =
-			candidates[Math.max(0, Math.min(index, candidates.length - 1))]!;
+		const chosen = selectShard(
+			key,
+			candidates,
+			request.balance ?? defaultBalance
+		);
 		shardLoadByShard.set(
 			chosen.id,
 			(shardLoadByShard.get(chosen.id) ?? 0) + 1
@@ -574,18 +676,27 @@ export const createRouter = (options: RouterOptions): Router => {
 		return finishSpan({ decision: 'allow', shard: chosen });
 	};
 
-	const acquire: Router['acquire'] = (tenantId) => {
+	const acquire: Router['acquire'] = (tenantId, shardId) => {
 		// 0.3.0: span the acquire. It's instantaneous bookkeeping, but
 		// the per-tenant active count is one of the most operationally
 		// interesting metrics — a sustained climb signals tenants
 		// holding more connections than expected.
 		const span = tracer.startSpan('router.acquire', {
-			attributes: { [ABS_ATTRS.tenant]: tenantId }
+			attributes: {
+				[ABS_ATTRS.tenant]: tenantId,
+				...(shardId === undefined
+					? {}
+					: { [ABS_ATTRS.routeShard]: shardId })
+			}
 		});
 		const now = clock();
 		const state = ensureTenant(tenantId, now);
 		state.active += 1;
 		totalAcquires += 1;
+		// 0.6.0: per-shard accounting. Only shard-tagged acquires
+		// participate, so a 0.5.x caller keeps its old semantics.
+		if (shardId !== undefined)
+			shardActive.set(shardId, (shardActive.get(shardId) ?? 0) + 1);
 		span.setAttribute('abs.tenant.active', state.active);
 		span.setStatus({ code: 1 /* OK */ });
 		span.end();
@@ -597,6 +708,10 @@ export const createRouter = (options: RouterOptions): Router => {
 				released = true;
 				const current = tenants.get(tenantId);
 				if (current && current.active > 0) current.active -= 1;
+				if (shardId === undefined) return;
+				const active = shardActive.get(shardId);
+				if (active !== undefined && active > 0)
+					shardActive.set(shardId, active - 1);
 			}
 		};
 	};
@@ -615,6 +730,8 @@ export const createRouter = (options: RouterOptions): Router => {
 			draining.clear();
 			tenants.clear();
 			routeBuckets.clear();
+			rotation.clear();
+			shardActive.clear();
 		},
 		drainShard: (id) => {
 			if (healthy.has(id)) draining.add(id);
@@ -626,6 +743,7 @@ export const createRouter = (options: RouterOptions): Router => {
 			lastRouteMs,
 			rejectsByDecision: { ...rejectsByDecision },
 			routes: totalRoutes,
+			shardActiveConnections: Object.fromEntries(shardActive),
 			shardLoadDistribution: Object.fromEntries(shardLoadByShard)
 		}),
 		markHealthy: (id) => {
@@ -642,6 +760,7 @@ export const createRouter = (options: RouterOptions): Router => {
 			if (at >= 0) shardList.splice(at, 1);
 			healthy.delete(id);
 			draining.delete(id);
+			shardActive.delete(id);
 		},
 		route,
 		shards: () => shardList.map((shard) => ({ ...shard })),
@@ -670,18 +789,16 @@ export const createRouter = (options: RouterOptions): Router => {
 			return {
 				at: now,
 				routeBuckets: routesOut,
-				shards: shardList.map((shard) => {
-					const active = Array.from(tenants.values()).reduce(
-						(acc, state) => acc + state.active,
-						0
-					);
-					return {
-						...shard,
-						active,
-						draining: draining.has(shard.id),
-						healthy: healthy.get(shard.id) === true
-					};
-				}),
+				// 0.6.0: `active` is now this shard's own connection count
+				// from shard-tagged acquires. Before 0.6.0 every shard
+				// reported the cluster-wide tenant total, which made the
+				// field useless for spotting a hot replica.
+				shards: shardList.map((shard) => ({
+					...shard,
+					active: shardActive.get(shard.id) ?? 0,
+					draining: draining.has(shard.id),
+					healthy: healthy.get(shard.id) === true
+				})),
 				tenants: tenantsOut,
 				version: 1
 			};
@@ -702,9 +819,15 @@ export const createRouter = (options: RouterOptions): Router => {
 					tokens: r.tokens
 				});
 			}
+			shardActive.clear();
 			for (const shard of snap.shards) {
 				healthy.set(shard.id, shard.healthy);
 				if (shard.draining) draining.add(shard.id);
+				// Connections do not survive a process restart, so
+				// `resetConnections` zeroes per-shard counts the same way it
+				// zeroes per-tenant ones.
+				if (!restoreOptions?.resetConnections && shard.active > 0)
+					shardActive.set(shard.id, shard.active);
 			}
 		}
 	};

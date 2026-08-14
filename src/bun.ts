@@ -298,7 +298,13 @@ export const createBunGateway = (options: BunGatewayOptions) => {
 			return rejection(decision.decision);
 
 		const target = targetFor(decision.shard, request, options.target);
-		const handle = options.router.acquire(routeRequest.tenantId);
+		// Tag the acquire with the shard so per-shard active counts stay
+		// accurate for the whole request/socket lifetime — that's what
+		// 'least-connections' balancing reads.
+		const handle = options.router.acquire(
+			routeRequest.tenantId,
+			decision.shard.id
+		);
 		const release = releaseOnce(handle);
 		const clientAddress = server.requestIP(request);
 		if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {

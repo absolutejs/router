@@ -23,6 +23,7 @@ describe('router.metrics() — 0.2.0', () => {
 				'no-tenant-shards': 0
 			},
 			routes: 0,
+			shardActiveConnections: {},
 			shardLoadDistribution: {}
 		});
 	});

@@ -84,6 +84,31 @@ ws.data = {
 - **`rendezvous`** — HRW hash. Supports per-shard `weight` for heterogeneous engine sizes; ALSO supports the `load: (shardId) => number` hook for runtime hot-spot avoidance — `effectiveWeight = weight / load`. O(N) per lookup.
 - **Custom**: pass `(key, shards) => index`.
 
+Hash strategies only apply to `'sticky'` balancing — see below.
+
+### Balance strategies (0.6.0)
+
+A hash strategy answers "which shard OWNS this key?". That is the right question when a shard holds the key's state, and the wrong one when the shards are interchangeable replicas of one stateless app — hashing pins all of a tenant's traffic to a single replica however many are registered. `balance` picks the question:
+
+- **`'sticky'`** (default) — consistent hash through `hashStrategy`. Same key, same shard. For *session affinity*, pass a per-client `channelId`: each client sticks to one replica while different clients spread out.
+- **`'round-robin'`** — successive calls for the same key cycle the eligible shards. The cursor is per routing key, so one busy tenant can't skew another's spread.
+- **`'least-connections'`** — fewest active connections wins, from shard-tagged `acquire()` calls. Ties break round-robin so an idle field of replicas still spreads.
+
+Set a router-wide default and override per call:
+
+```ts
+const router = createRouter({ balance: 'round-robin', shards });
+
+router.route({ tenantId }); // round-robin across replicas
+router.route({ tenantId, balance: 'sticky', channelId: sessionId }); // affinity
+```
+
+All three respect health, draining, tenant allowlists and region filters identically. `'round-robin'` and `'least-connections'` ignore `hashStrategy` and make no cross-call stability promise.
+
+### Per-shard connection accounting (0.6.0)
+
+`acquire(tenantId, shardId?)` takes the shard the connection was routed to. Tagged acquires maintain a live per-shard active count — what `'least-connections'` reads, and what `metrics().shardActiveConnections` reports next to the cumulative `shardLoadDistribution`. `createBunGateway` tags automatically. Omitting the id keeps the pre-0.6.0 behaviour: the tenant cap is still enforced, the connection is just invisible per-shard.
+
 ### Drain mode
 
 `drainShard(id)` excludes a shard from new routing without marking it broken. Use this before a planned shard shutdown — tenants on the draining shard rehash to healthy non-draining shards on their NEXT route, but in-flight requests aren't torn down. The caller waits for the shard to be quiet (e.g. via the runtime's stats), then `removeShard()`. `markHealthy()` cancels a drain in case ops changes their mind.
