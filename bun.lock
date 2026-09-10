@@ -8,7 +8,7 @@
         "@absolutejs/telemetry": "^0.3.0",
       },
       "devDependencies": {
-        "@absolutejs/changelog": "^0.2.0",
+        "@absolutejs/changelog": "^0.4.0",
         "@types/bun": "^1.3.14",
         "prettier": "^3.8.3",
         "typescript": "^6.0.3",
@@ -16,7 +16,7 @@
     },
   },
   "packages": {
-    "@absolutejs/changelog": ["@absolutejs/changelog@0.2.0", "", { "bin": { "absolute-changelog": "dist/cli.js" } }, "sha512-9GdRyWB3X5zEwlTcVCH+qUS84FTChCoZvli0z3Gp8SI3pnLN4XK3vO0s45dPk5ZfezxAzC1ZwlKWTh44eLxh1w=="],
+    "@absolutejs/changelog": ["@absolutejs/changelog@0.4.0", "", { "dependencies": { "typescript": "^5.8.3" }, "bin": { "absolute-changelog": "dist/cli.js" } }, "sha512-4+rna0EUk1kZMGHJRmXIWvP+MV6pS4Ay24m+3h0XybYD/4ycgOXwdez7CUdb6hZQr7GC7XXTyhDzheEDAdlFcQ=="],
 
     "@absolutejs/handoff": ["@absolutejs/handoff@0.1.0", "", { "dependencies": { "@absolutejs/manifest": "0.7.2", "@sinclair/typebox": "0.34.52" } }, "sha512-P9Wr2oyYBcj7mriCV4h9zRlLGijee/7DW8USVkl/m4ovql7zpITy547jy6j8+HC5v5Ocs+TVcMYmrROEEBupNg=="],
 
@@ -37,5 +37,7 @@
     "typescript": ["typescript@6.0.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw=="],
 
     "undici-types": ["undici-types@7.24.6", "", {}, "sha512-WRNW+sJgj5OBN4/0JpHFqtqzhpbnV0GuB+OozA9gCL7a993SmU+1JBZCzLNxYsbMfIeDL+lTsphD5jN5N+n0zg=="],
+
+    "@absolutejs/changelog/typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
   }
 }
