@@ -12,6 +12,7 @@ describe('Bun gateway adapter', () => {
 					body: await request.text(),
 					forwardedFor: request.headers.get('x-forwarded-for'),
 					forwardedHost: request.headers.get('x-forwarded-host'),
+					forwardedProtocol: request.headers.get('x-forwarded-proto'),
 					path: new URL(request.url).pathname
 				}),
 			port: 0
@@ -41,7 +42,8 @@ describe('Bun gateway adapter', () => {
 					body: 'payload',
 					headers: {
 						host: 'alpha.dev.localhost',
-						'x-forwarded-for': 'spoofed'
+						'x-forwarded-for': 'spoofed',
+						'x-forwarded-proto': 'https'
 					},
 					method: 'POST'
 				}
@@ -56,6 +58,81 @@ describe('Bun gateway adapter', () => {
 			expect(body).toMatchObject({
 				body: 'payload',
 				forwardedHost: 'alpha.dev.localhost',
+				forwardedProtocol: 'http',
+				path: '/editor'
+			});
+			expect(body.forwardedFor).toEndWith('127.0.0.1');
+			expect(body.forwardedFor).not.toContain('spoofed');
+
+			const wrongTenant = await fetch(
+				`http://127.0.0.1:${edge.port}/editor`,
+				{ headers: { host: 'beta.dev.localhost' } }
+			);
+			expect(wrongTenant.status).toBe(503);
+			expect(await wrongTenant.json()).toMatchObject({
+				decision: 'no-tenant-shards'
+			});
+		} finally {
+			await closeServer(edge);
+			await closeServer(upstream);
+		}
+	});
+
+	test('preserves the configured HTTPS public scheme behind an HTTP ingress', async () => {
+		const upstream = Bun.serve({
+			fetch: async (request) =>
+				Response.json({
+					body: await request.text(),
+					forwardedFor: request.headers.get('x-forwarded-for'),
+					forwardedHost: request.headers.get('x-forwarded-host'),
+					forwardedProtocol: request.headers.get('x-forwarded-proto'),
+					path: new URL(request.url).pathname
+				}),
+			port: 0
+		});
+		const router = createRouter({
+			perTenantConnectionCap: 1,
+			shards: [
+				{
+					id: 'alpha',
+					tenants: ['alpha'],
+					url: `http://127.0.0.1:${upstream.port}`
+				}
+			]
+		});
+		const gateway = createBunGateway({
+			publicProtocol: 'https',
+			resolve: (request) => ({
+				tenantId: request.headers.get('host')?.split('.')[0] ?? ''
+			}),
+			router
+		});
+		const edge = Bun.serve({ ...gateway, port: 0 });
+
+		try {
+			const response = await fetch(
+				`http://127.0.0.1:${edge.port}/editor`,
+				{
+					body: 'payload',
+					headers: {
+						host: 'alpha.dev.localhost',
+						'x-forwarded-for': 'spoofed',
+						'x-forwarded-proto': 'http'
+					},
+					method: 'POST'
+				}
+			);
+			expect(response.status).toBe(200);
+			const body = (await response.json()) as {
+				body: string;
+				forwardedFor: string;
+				forwardedHost: string;
+				path: string;
+			};
+			expect(body).toMatchObject({
+				body: 'payload',
+				forwardedHost: 'alpha.dev.localhost',
+				forwardedProtocol: 'https',
 				path: '/editor'
 			});
 			expect(body.forwardedFor).toEndWith('127.0.0.1');
@@ -76,11 +153,14 @@ describe('Bun gateway adapter', () => {
 	});
 
 	test('bridges WebSocket frames and holds the connection cap until close', async () => {
+		const forwarded: { protocol: string | null } = { protocol: null };
 		const upstream = Bun.serve({
-			fetch: (request, server) =>
-				server.upgrade(request)
+			fetch: (request, server) => {
+				forwarded.protocol = request.headers.get('x-forwarded-proto');
+				return server.upgrade(request)
 					? undefined
-					: new Response('upgrade failed', { status: 500 }),
+					: new Response('upgrade failed', { status: 500 });
+			},
 			port: 0,
 			websocket: {
 				message: (socket, message) => {
@@ -99,6 +179,7 @@ describe('Bun gateway adapter', () => {
 			]
 		});
 		const gateway = createBunGateway({
+			publicProtocol: 'https',
 			resolve: () => ({ tenantId: 'alpha' }),
 			router
 		});
@@ -125,6 +206,7 @@ describe('Bun gateway adapter', () => {
 					{ once: true }
 				);
 			});
+			expect(forwarded.protocol).toBe('https');
 			client.send('hello');
 			expect(await message).toBe('upstream:hello');
 

@@ -90,7 +90,7 @@ Hash strategies only apply to `'sticky'` balancing — see below.
 
 A hash strategy answers "which shard OWNS this key?". That is the right question when a shard holds the key's state, and the wrong one when the shards are interchangeable replicas of one stateless app — hashing pins all of a tenant's traffic to a single replica however many are registered. `balance` picks the question:
 
-- **`'sticky'`** (default) — consistent hash through `hashStrategy`. Same key, same shard. For *session affinity*, pass a per-client `channelId`: each client sticks to one replica while different clients spread out.
+- **`'sticky'`** (default) — consistent hash through `hashStrategy`. Same key, same shard. For _session affinity_, pass a per-client `channelId`: each client sticks to one replica while different clients spread out.
 - **`'round-robin'`** — successive calls for the same key cycle the eligible shards. The cursor is per routing key, so one busy tenant can't skew another's spread.
 - **`'least-connections'`** — fewest active connections wins, from shard-tagged `acquire()` calls. Ties break round-robin so an idle field of replicas still spreads.
 
@@ -268,3 +268,12 @@ const decision = router.route({
 ## License
 
 BSL 1.1 with a named carveout for the hosted multi-tenant connection routing / WebSocket edge gateway category (Cloudflare Workers WebSockets, Cloudflare Smart Placement, Vercel edge router, Liveblocks' WebSocket fan-out, PartyKit, Ably, Pusher, Soketi). See [LICENSE](./LICENSE). Change Date: 4 years from first release; Change License: Apache 2.0.
+
+### TLS termination before the Bun gateway
+
+When a trusted ingress terminates HTTPS and connects to the gateway over HTTP,
+set `publicProtocol: 'https'` in `createBunGateway`. The gateway will advertise
+the public scheme to upstream HTTP and WebSocket servers using
+`X-Forwarded-Proto`, so same-origin checks compare against the browser's origin.
+The default remains the incoming request's scheme. Client-supplied forwarding
+headers never select the public protocol; configure it from trusted deployment settings.

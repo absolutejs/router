@@ -58,6 +58,8 @@ export type BunGatewayOptions = {
 	target?: (shard: Shard, request: Request) => string | URL;
 	/** Preserve a trusted ingress proxy's X-Forwarded-For chain. Default false. */
 	trustForwardedFor?: boolean;
+	/** Public scheme when TLS terminates before this gateway. Never read from client headers. */
+	publicProtocol?: 'http' | 'https';
 	upstreamOpenTimeoutMs?: number;
 	onError?: (error: unknown, request: Request) => void;
 };
@@ -99,7 +101,8 @@ const deleteHeaders = (headers: Headers, names: readonly string[]) => {
 const forwardedHeaders = (
 	request: Request,
 	clientAddress?: SocketAddress | null,
-	trustForwardedFor = false
+	trustForwardedFor = false,
+	publicProtocol?: 'http' | 'https'
 ) => {
 	const incoming = new URL(request.url);
 	const headers = new Headers(request.headers);
@@ -109,7 +112,10 @@ const forwardedHeaders = (
 		'x-forwarded-host',
 		request.headers.get('host') ?? incoming.host
 	);
-	headers.set('x-forwarded-proto', incoming.protocol.slice(0, -1));
+	headers.set(
+		'x-forwarded-proto',
+		publicProtocol ?? incoming.protocol.slice(0, -1)
+	);
 	if (clientAddress?.address) {
 		const prior = trustForwardedFor ? headers.get('x-forwarded-for') : null;
 		headers.set(
@@ -140,12 +146,18 @@ const proxyHttp = async (
 	request: Request,
 	target: URL,
 	clientAddress?: SocketAddress | null,
-	trustForwardedFor?: boolean
+	trustForwardedFor?: boolean,
+	publicProtocol?: 'http' | 'https'
 ) => {
 	const method = request.method.toUpperCase();
 	const upstream = await fetch(target, {
 		body: method === 'GET' || method === 'HEAD' ? undefined : request.body,
-		headers: forwardedHeaders(request, clientAddress, trustForwardedFor),
+		headers: forwardedHeaders(
+			request,
+			clientAddress,
+			trustForwardedFor,
+			publicProtocol
+		),
 		method,
 		redirect: 'manual',
 		signal: request.signal
@@ -179,9 +191,15 @@ const connectWebSocket = async (
 	target: URL,
 	timeoutMs: number,
 	clientAddress?: SocketAddress | null,
-	trustForwardedFor?: boolean
+	trustForwardedFor?: boolean,
+	publicProtocol?: 'http' | 'https'
 ) => {
-	const headers = forwardedHeaders(request, clientAddress, trustForwardedFor);
+	const headers = forwardedHeaders(
+		request,
+		clientAddress,
+		trustForwardedFor,
+		publicProtocol
+	);
 	deleteHeaders(headers, WEBSOCKET_HANDSHAKE_HEADERS);
 	const WebSocketClient = WebSocket as unknown as {
 		new (url: string | URL, options?: Bun.WebSocketOptions): WebSocket;
@@ -313,7 +331,8 @@ export const createBunGateway = (options: BunGatewayOptions) => {
 					request,
 					target,
 					clientAddress,
-					options.trustForwardedFor
+					options.trustForwardedFor,
+					options.publicProtocol
 				);
 			} catch (error) {
 				options.onError?.(error, request);
@@ -333,7 +352,8 @@ export const createBunGateway = (options: BunGatewayOptions) => {
 				options.upstreamOpenTimeoutMs ??
 					DEFAULT_UPSTREAM_OPEN_TIMEOUT_MS,
 				clientAddress,
-				options.trustForwardedFor
+				options.trustForwardedFor,
+				options.publicProtocol
 			);
 			const data: BunGatewaySocketData = {
 				pending: [],

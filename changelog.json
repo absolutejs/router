@@ -1,5 +1,21 @@
 {
 	"contract": 1,
 	"name": "@absolutejs/router",
-	"releases": []
+	"releases": [
+		{
+			"changes": [
+				{
+					"detail": "Set publicProtocol from trusted deployment settings when ingress terminates TLS. Forged client forwarding headers remain ignored.",
+					"kind": "fixed",
+					"summary": "Preserve the configured public HTTPS protocol through HTTP and WebSocket gateways behind TLS termination",
+					"symbols": [
+						"BunGatewayOptions",
+						"createBunGateway"
+					]
+				}
+			],
+			"date": "2026-09-20",
+			"version": "0.6.1"
+		}
+	]
 }
