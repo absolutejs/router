@@ -292,4 +292,64 @@ describe('Bun gateway adapter', () => {
 			await closeServer(upstream);
 		}
 	});
+	/* Behind the PaaS edge an app saw http://10.50.0.4:46048 as its own URL,
+	 * so sign-in return links carried the internal port and were refused as
+	 * cross-origin (Management, 2026-10-20). */
+	test('preserveHost hands the upstream the public host over HTTP and WebSocket', async () => {
+		const seen: string[] = [];
+		const upstream = Bun.serve({
+			fetch: (request, server) => {
+				seen.push(`${request.url} host=${request.headers.get('host')}`);
+				if (server.upgrade(request)) return undefined;
+
+				return new Response('ok');
+			},
+			port: 0,
+			websocket: { message: () => {}, open: (socket) => socket.close() }
+		});
+		const gatewayFor = (preserveHost: boolean) =>
+			createBunGateway({
+				preserveHost,
+				resolve: () => ({ tenantId: 'alpha' }),
+				router: createRouter({
+					perTenantConnectionCap: 4,
+					shards: [
+						{
+							id: 'alpha',
+							tenants: ['alpha'],
+							url: `http://127.0.0.1:${upstream.port}`
+						}
+					]
+				})
+			});
+		const preserving = Bun.serve({ ...gatewayFor(true), port: 0 });
+		const rewriting = Bun.serve({ ...gatewayFor(false), port: 0 });
+
+		try {
+			await fetch(`http://127.0.0.1:${preserving.port}/callback?x=1`, {
+				headers: { host: 'app.example.com' }
+			});
+			const socket = new (WebSocket as unknown as {
+				new (url: string, options?: Bun.WebSocketOptions): WebSocket;
+			})(`ws://127.0.0.1:${preserving.port}/live`, {
+				headers: { host: 'app.example.com' }
+			});
+			await new Promise((resolve) => {
+				socket.addEventListener('close', resolve, { once: true });
+			});
+			await fetch(`http://127.0.0.1:${rewriting.port}/callback`, {
+				headers: { host: 'app.example.com' }
+			});
+
+			expect(seen).toEqual([
+				'http://app.example.com/callback?x=1 host=app.example.com',
+				'http://app.example.com/live host=app.example.com',
+				`http://127.0.0.1:${upstream.port}/callback host=127.0.0.1:${upstream.port}`
+			]);
+		} finally {
+			closeServer(preserving);
+			closeServer(rewriting);
+			closeServer(upstream);
+		}
+	});
 });
