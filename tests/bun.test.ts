@@ -78,6 +78,70 @@ describe('Bun gateway adapter', () => {
 		}
 	});
 
+	test('passes a compressed response through without decompressing it', async () => {
+		const original = 'console.log("hello");\n'.repeat(200);
+		const compressed = Bun.gzipSync(original);
+		const seen: (string | null)[] = [];
+		const upstream = Bun.serve({
+			fetch: (request) => {
+				const accepted = request.headers.get('accept-encoding');
+				seen.push(accepted);
+				return accepted?.includes('gzip')
+					? new Response(compressed, {
+							headers: {
+								'content-encoding': 'gzip',
+								'content-type': 'text/javascript'
+							}
+						})
+					: new Response(original, {
+							headers: { 'content-type': 'text/javascript' }
+						});
+			},
+			port: 0
+		});
+		const router = createRouter({
+			shards: [
+				{
+					id: 'alpha',
+					tenants: ['alpha'],
+					url: `http://127.0.0.1:${upstream.port}`
+				}
+			]
+		});
+		const gateway = createBunGateway({
+			resolve: () => ({ tenantId: 'alpha' }),
+			router
+		});
+		const edge = Bun.serve({ ...gateway, port: 0 });
+
+		try {
+			const encoded = await fetch(
+				`http://127.0.0.1:${edge.port}/app.js`,
+				{
+					decompress: false,
+					headers: { 'accept-encoding': 'gzip' }
+				}
+			);
+			expect(encoded.headers.get('content-encoding')).toBe('gzip');
+			const bytes = new Uint8Array(await encoded.arrayBuffer());
+			expect(bytes).toEqual(new Uint8Array(compressed));
+			expect(new TextDecoder().decode(Bun.gunzipSync(bytes))).toBe(
+				original
+			);
+
+			const plain = await fetch(`http://127.0.0.1:${edge.port}/app.js`, {
+				decompress: false,
+				headers: { 'accept-encoding': 'identity' }
+			});
+			expect(plain.headers.get('content-encoding')).toBeNull();
+			expect(await plain.text()).toBe(original);
+			expect(seen).toEqual(['gzip', 'identity']);
+		} finally {
+			closeServer(edge);
+			closeServer(upstream);
+		}
+	});
+
 	test('preserves the configured HTTPS public scheme behind an HTTP ingress', async () => {
 		const upstream = Bun.serve({
 			fetch: async (request) =>

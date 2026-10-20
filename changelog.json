@@ -5,6 +5,16 @@
 		{
 			"changes": [
 				{
+					"kind": "fixed",
+					"summary": "Pass compressed responses through the Bun gateway as the app encoded them"
+				}
+			],
+			"date": "2026-10-20",
+			"version": "0.6.2"
+		},
+		{
+			"changes": [
+				{
 					"detail": "Set publicProtocol from trusted deployment settings when ingress terminates TLS. Forged client forwarding headers remain ignored.",
 					"kind": "fixed",
 					"summary": "Preserve the configured public HTTPS protocol through HTTP and WebSocket gateways behind TLS termination",

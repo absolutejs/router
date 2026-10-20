@@ -150,23 +150,32 @@ const proxyHttp = async (
 	publicProtocol?: 'http' | 'https'
 ) => {
 	const method = request.method.toUpperCase();
+	const headers = forwardedHeaders(
+		request,
+		clientAddress,
+		trustForwardedFor,
+		publicProtocol
+	);
+	// Bun's fetch asks for compression a client never asked for, and
+	// decompresses what comes back while keeping its Content-Encoding: a
+	// browser then fails to decode the plain body (every precompressed asset
+	// behind the edge, 2026-10-20). The body passes through exactly as the
+	// app encoded it, for exactly what the client accepts.
+	if (!headers.has('accept-encoding'))
+		headers.set('accept-encoding', 'identity');
 	const upstream = await fetch(target, {
 		body: method === 'GET' || method === 'HEAD' ? undefined : request.body,
-		headers: forwardedHeaders(
-			request,
-			clientAddress,
-			trustForwardedFor,
-			publicProtocol
-		),
+		decompress: false,
+		headers,
 		method,
 		redirect: 'manual',
 		signal: request.signal
 	});
-	const headers = new Headers(upstream.headers);
-	deleteHeaders(headers, HOP_BY_HOP_HEADERS);
+	const responseHeaders = new Headers(upstream.headers);
+	deleteHeaders(responseHeaders, HOP_BY_HOP_HEADERS);
 
 	return new Response(upstream.body, {
-		headers,
+		headers: responseHeaders,
 		status: upstream.status,
 		statusText: upstream.statusText
 	});
