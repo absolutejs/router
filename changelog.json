@@ -5,6 +5,19 @@
 		{
 			"changes": [
 				{
+					"kind": "added",
+					"summary": "preserveHost: send the client's Host to the upstream so apps behind the gateway see their public name",
+					"symbols": [
+						"BunGatewayOptions"
+					]
+				}
+			],
+			"date": "2026-10-20",
+			"version": "0.7.0"
+		},
+		{
+			"changes": [
+				{
 					"kind": "fixed",
 					"summary": "Pass compressed responses through the Bun gateway as the app encoded them"
 				}

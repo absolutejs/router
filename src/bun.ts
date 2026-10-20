@@ -60,6 +60,11 @@ export type BunGatewayOptions = {
 	trustForwardedFor?: boolean;
 	/** Public scheme when TLS terminates before this gateway. Never read from client headers. */
 	publicProtocol?: 'http' | 'https';
+	/** Send the client's Host to the upstream instead of the shard's address,
+	 *  as reverse proxies normally do. Apps behind the gateway then build URLs
+	 *  (callbacks, redirects, emailed links) from their public name rather than
+	 *  an internal host:port. X-Forwarded-Host is set either way. Default false. */
+	preserveHost?: boolean;
 	upstreamOpenTimeoutMs?: number;
 	onError?: (error: unknown, request: Request) => void;
 };
@@ -98,26 +103,31 @@ const deleteHeaders = (headers: Headers, names: readonly string[]) => {
 	for (const name of names) headers.delete(name);
 };
 
+type Forwarding = Pick<
+	BunGatewayOptions,
+	'preserveHost' | 'publicProtocol' | 'trustForwardedFor'
+>;
+
 const forwardedHeaders = (
 	request: Request,
-	clientAddress?: SocketAddress | null,
-	trustForwardedFor = false,
-	publicProtocol?: 'http' | 'https'
+	clientAddress: SocketAddress | null | undefined,
+	forwarding: Forwarding
 ) => {
 	const incoming = new URL(request.url);
+	const publicHost = request.headers.get('host') ?? incoming.host;
 	const headers = new Headers(request.headers);
 	deleteHeaders(headers, HOP_BY_HOP_HEADERS);
-	headers.delete('host');
-	headers.set(
-		'x-forwarded-host',
-		request.headers.get('host') ?? incoming.host
-	);
+	if (forwarding.preserveHost) headers.set('host', publicHost);
+	else headers.delete('host');
+	headers.set('x-forwarded-host', publicHost);
 	headers.set(
 		'x-forwarded-proto',
-		publicProtocol ?? incoming.protocol.slice(0, -1)
+		forwarding.publicProtocol ?? incoming.protocol.slice(0, -1)
 	);
 	if (clientAddress?.address) {
-		const prior = trustForwardedFor ? headers.get('x-forwarded-for') : null;
+		const prior = forwarding.trustForwardedFor
+			? headers.get('x-forwarded-for')
+			: null;
 		headers.set(
 			'x-forwarded-for',
 			prior ? `${prior}, ${clientAddress.address}` : clientAddress.address
@@ -145,17 +155,11 @@ const targetFor = (
 const proxyHttp = async (
 	request: Request,
 	target: URL,
-	clientAddress?: SocketAddress | null,
-	trustForwardedFor?: boolean,
-	publicProtocol?: 'http' | 'https'
+	clientAddress: SocketAddress | null | undefined,
+	forwarding: Forwarding
 ) => {
 	const method = request.method.toUpperCase();
-	const headers = forwardedHeaders(
-		request,
-		clientAddress,
-		trustForwardedFor,
-		publicProtocol
-	);
+	const headers = forwardedHeaders(request, clientAddress, forwarding);
 	// Bun's fetch asks for compression a client never asked for, and
 	// decompresses what comes back while keeping its Content-Encoding: a
 	// browser then fails to decode the plain body (every precompressed asset
@@ -199,16 +203,10 @@ const connectWebSocket = async (
 	request: Request,
 	target: URL,
 	timeoutMs: number,
-	clientAddress?: SocketAddress | null,
-	trustForwardedFor?: boolean,
-	publicProtocol?: 'http' | 'https'
+	clientAddress: SocketAddress | null | undefined,
+	forwarding: Forwarding
 ) => {
-	const headers = forwardedHeaders(
-		request,
-		clientAddress,
-		trustForwardedFor,
-		publicProtocol
-	);
+	const headers = forwardedHeaders(request, clientAddress, forwarding);
 	deleteHeaders(headers, WEBSOCKET_HANDSHAKE_HEADERS);
 	const WebSocketClient = WebSocket as unknown as {
 		new (url: string | URL, options?: Bun.WebSocketOptions): WebSocket;
@@ -336,13 +334,7 @@ export const createBunGateway = (options: BunGatewayOptions) => {
 		const clientAddress = server.requestIP(request);
 		if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
 			try {
-				return await proxyHttp(
-					request,
-					target,
-					clientAddress,
-					options.trustForwardedFor,
-					options.publicProtocol
-				);
+				return await proxyHttp(request, target, clientAddress, options);
 			} catch (error) {
 				options.onError?.(error, request);
 
@@ -361,8 +353,7 @@ export const createBunGateway = (options: BunGatewayOptions) => {
 				options.upstreamOpenTimeoutMs ??
 					DEFAULT_UPSTREAM_OPEN_TIMEOUT_MS,
 				clientAddress,
-				options.trustForwardedFor,
-				options.publicProtocol
+				options
 			);
 			const data: BunGatewaySocketData = {
 				pending: [],
