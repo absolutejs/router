@@ -21,6 +21,19 @@ const makeShards = (n: number): Shard[] =>
 	}));
 
 describe('createRouter', () => {
+	test('a request can exclude shards that already failed it', () => {
+		const router = createRouter({ shards: makeShards(2) });
+		const first = router.route({ tenantId: 'alpha' });
+		const failed = first.shard?.id ?? '';
+		expect(
+			router.route({ excludeShards: [failed], tenantId: 'alpha' }).shard
+				?.id
+		).not.toBe(failed);
+		expect(
+			router.route({ excludeShards: ['s0', 's1'], tenantId: 'alpha' })
+		).toMatchObject({ decision: 'no-shards', shard: null });
+	});
+
 	test('tenant-affine shards never receive another tenant', () => {
 		const router = createRouter({
 			shards: [

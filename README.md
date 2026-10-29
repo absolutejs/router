@@ -277,3 +277,19 @@ the public scheme to upstream HTTP and WebSocket servers using
 `X-Forwarded-Proto`, so same-origin checks compare against the browser's origin.
 The default remains the incoming request's scheme. Client-supplied forwarding
 headers never select the public protocol; configure it from trusted deployment settings.
+
+### When an upstream fails
+
+A request whose upstream cannot be reached (refused, reset or unroutable
+before any response) is sent once more, to another shard, when its method is
+safe to repeat: GET, HEAD and OPTIONS by default. The retry is an ordinary
+`route()` with the failed shard in `excludeShards`, so it is balanced, capped
+and rate limited like the first. A POST is never sent twice. Tune it with
+`retry: { attempts, methods }`, or turn it off with `retry: false`.
+
+`onUpstreamFailure` is called for each upstream that failed a request, so the
+caller can mark that shard unhealthy at once instead of waiting for its next
+health check. `upstreamHeadersTimeoutMs` bounds how long an upstream may take
+to send its response headers (the body then streams for as long as it needs).
+A request that runs out of time answers 504 and is never retried, so slow work
+never runs twice.

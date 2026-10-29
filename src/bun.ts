@@ -21,6 +21,7 @@ import type {
 } from './index';
 
 const HTTP_BAD_GATEWAY = 502;
+const HTTP_GATEWAY_TIMEOUT = 504;
 const HTTP_FORBIDDEN = 403;
 const HTTP_NOT_FOUND = 404;
 const HTTP_SERVICE_UNAVAILABLE = 503;
@@ -28,6 +29,9 @@ const HTTP_TOO_MANY_REQUESTS = 429;
 const HTTP_INTERNAL_SERVER_ERROR = 500;
 const WEBSOCKET_INTERNAL_ERROR = 1011;
 const DEFAULT_UPSTREAM_OPEN_TIMEOUT_MS = 10_000;
+const DEFAULT_RETRY_ATTEMPTS = 1;
+// Safe to repeat: a retry can never apply a change twice.
+const DEFAULT_RETRY_METHODS = ['GET', 'HEAD', 'OPTIONS'] as const;
 
 const HOP_BY_HOP_HEADERS = [
 	'connection',
@@ -49,6 +53,17 @@ const WEBSOCKET_HANDSHAKE_HEADERS = [
 
 export type BunGatewayResolution = RouteRequest | null;
 
+/** How an upstream failed a request: it could not be reached at all, or it
+ *  sent no response headers within `upstreamHeadersTimeoutMs`. */
+export type UpstreamFailureKind = 'timeout' | 'unreachable';
+
+export type UpstreamFailure = {
+	error: unknown;
+	kind: UpstreamFailureKind;
+	request: Request;
+	shard: Shard;
+};
+
 export type BunGatewayOptions = {
 	router: Pick<Router, 'acquire' | 'route'>;
 	resolve: (
@@ -66,6 +81,28 @@ export type BunGatewayOptions = {
 	 *  an internal host:port. X-Forwarded-Host is set either way. Default false. */
 	preserveHost?: boolean;
 	upstreamOpenTimeoutMs?: number;
+	/**
+	 * Abort an upstream that sends no response headers within this long. It
+	 * counts as a failed upstream (`onUpstreamFailure`, kind `'timeout'`) and
+	 * answers 504, but the request is never retried, so slow work never runs
+	 * twice. Default: no limit. Added in 0.8.0.
+	 */
+	upstreamHeadersTimeoutMs?: number;
+	/**
+	 * Send a request whose upstream could not be reached (refused, reset or
+	 * unroutable before any response) to another shard. Only methods that are
+	 * safe to repeat are retried. Each retry is a fresh `route()` that
+	 * excludes the shards already tried, so it is balanced, capped and rate
+	 * limited like any request. `false` turns retries off. Default: one retry
+	 * for GET, HEAD and OPTIONS. Added in 0.8.0.
+	 */
+	retry?: false | { attempts?: number; methods?: readonly string[] };
+	/**
+	 * Called for each upstream that failed a request, before any retry, so the
+	 * caller can stop routing to a dead shard at once rather than on its next
+	 * health check. Not called when the client went away. Added in 0.8.0.
+	 */
+	onUpstreamFailure?: (failure: UpstreamFailure) => void;
 	onError?: (error: unknown, request: Request) => void;
 };
 
@@ -152,11 +189,40 @@ const targetFor = (
 	return target;
 };
 
+class UpstreamHeadersTimeoutError extends Error {}
+
+/** The client's abort, plus a deadline for the response headers alone: once
+ *  they arrive the body streams for as long as it takes. */
+const headersDeadline = (request: Request, timeoutMs?: number) => {
+	if (timeoutMs === undefined)
+		return {
+			clear: () => undefined,
+			signal: request.signal,
+			timedOut: () => false
+		};
+	const controller = new AbortController();
+	let expired = false;
+	const timer = setTimeout(() => {
+		expired = true;
+		controller.abort();
+	}, timeoutMs);
+	request.signal.addEventListener('abort', () => controller.abort(), {
+		once: true
+	});
+
+	return {
+		clear: () => clearTimeout(timer),
+		signal: controller.signal,
+		timedOut: () => expired
+	};
+};
+
 const proxyHttp = async (
 	request: Request,
 	target: URL,
 	clientAddress: SocketAddress | null | undefined,
-	forwarding: Forwarding
+	forwarding: Forwarding,
+	headersTimeoutMs?: number
 ) => {
 	const method = request.method.toUpperCase();
 	const headers = forwardedHeaders(request, clientAddress, forwarding);
@@ -167,14 +233,23 @@ const proxyHttp = async (
 	// app encoded it, for exactly what the client accepts.
 	if (!headers.has('accept-encoding'))
 		headers.set('accept-encoding', 'identity');
+	const deadline = headersDeadline(request, headersTimeoutMs);
 	const upstream = await fetch(target, {
 		body: method === 'GET' || method === 'HEAD' ? undefined : request.body,
 		decompress: false,
 		headers,
 		method,
 		redirect: 'manual',
-		signal: request.signal
-	});
+		signal: deadline.signal
+	})
+		.catch((error: unknown) => {
+			if (deadline.timedOut())
+				throw new UpstreamHeadersTimeoutError(
+					`Upstream sent no response headers within ${headersTimeoutMs}ms`
+				);
+			throw error;
+		})
+		.finally(deadline.clear);
 	const responseHeaders = new Headers(upstream.headers);
 	deleteHeaders(responseHeaders, HOP_BY_HOP_HEADERS);
 
@@ -311,6 +386,93 @@ const validCloseCode = (code: number) =>
 		: WEBSOCKET_INTERNAL_ERROR;
 
 export const createBunGateway = (options: BunGatewayOptions) => {
+	const retryMethods = new Set(
+		options.retry === false
+			? []
+			: (options.retry?.methods ?? DEFAULT_RETRY_METHODS).map((method) =>
+					method.toUpperCase()
+				)
+	);
+	const retryAttempts =
+		options.retry === false
+			? 0
+			: (options.retry?.attempts ?? DEFAULT_RETRY_ATTEMPTS);
+
+	/* One upstream, then — if it could not be reached and the request is
+	 * safe to repeat — the next shard the router picks without it. */
+	const serveHttp = async (
+		request: Request,
+		routeRequest: RouteRequest,
+		shard: Shard,
+		clientAddress: SocketAddress | null | undefined,
+		tried: readonly string[]
+	): Promise<Response> => {
+		// Tag the acquire with the shard so per-shard active counts stay
+		// accurate for the whole request lifetime — that's what
+		// 'least-connections' balancing reads.
+		const release = releaseOnce(
+			options.router.acquire(routeRequest.tenantId, shard.id)
+		);
+		let failure: unknown;
+		try {
+			return await proxyHttp(
+				request,
+				targetFor(shard, request, options.target),
+				clientAddress,
+				options,
+				options.upstreamHeadersTimeoutMs
+			);
+		} catch (error) {
+			failure = error;
+		} finally {
+			release();
+		}
+		const kind: UpstreamFailureKind =
+			failure instanceof UpstreamHeadersTimeoutError
+				? 'timeout'
+				: 'unreachable';
+		const clientGone = request.signal.aborted;
+		if (!clientGone)
+			options.onUpstreamFailure?.({
+				error: failure,
+				kind,
+				request,
+				shard
+			});
+		const retryable =
+			kind === 'unreachable' &&
+			!clientGone &&
+			tried.length < retryAttempts &&
+			retryMethods.has(request.method.toUpperCase());
+		const attempted = [...tried, shard.id];
+		const next = retryable
+			? options.router.route({
+					...routeRequest,
+					excludeShards: [
+						...(routeRequest.excludeShards ?? []),
+						...attempted
+					]
+				})
+			: null;
+		if (next?.decision === 'allow' && next.shard !== null)
+			return serveHttp(
+				request,
+				routeRequest,
+				next.shard,
+				clientAddress,
+				attempted
+			);
+		options.onError?.(failure, request);
+
+		return kind === 'timeout'
+			? new Response('Upstream timed out', {
+					status: HTTP_GATEWAY_TIMEOUT
+				})
+			: new Response('Upstream unavailable', {
+					status: HTTP_BAD_GATEWAY
+				});
+	};
+
 	const fetchHandler = async (
 		request: Request,
 		server: Server<BunGatewaySocketData>
@@ -322,29 +484,21 @@ export const createBunGateway = (options: BunGatewayOptions) => {
 		if (decision.decision !== 'allow' || decision.shard === null)
 			return rejection(decision.decision);
 
-		const target = targetFor(decision.shard, request, options.target);
-		// Tag the acquire with the shard so per-shard active counts stay
-		// accurate for the whole request/socket lifetime — that's what
-		// 'least-connections' balancing reads.
-		const handle = options.router.acquire(
-			routeRequest.tenantId,
-			decision.shard.id
-		);
-		const release = releaseOnce(handle);
 		const clientAddress = server.requestIP(request);
-		if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
-			try {
-				return await proxyHttp(request, target, clientAddress, options);
-			} catch (error) {
-				options.onError?.(error, request);
+		if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket')
+			return serveHttp(
+				request,
+				routeRequest,
+				decision.shard,
+				clientAddress,
+				[]
+			);
 
-				return new Response('Upstream unavailable', {
-					status: HTTP_BAD_GATEWAY
-				});
-			} finally {
-				release();
-			}
-		}
+		const target = targetFor(decision.shard, request, options.target);
+		// The socket's whole lifetime counts against its shard.
+		const release = releaseOnce(
+			options.router.acquire(routeRequest.tenantId, decision.shard.id)
+		);
 
 		try {
 			const upstream = await connectWebSocket(
