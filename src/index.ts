@@ -240,6 +240,12 @@ export type RouteRequest = {
 	 * side by side. Added in 0.6.0.
 	 */
 	balance?: BalanceStrategy;
+	/**
+	 * Shards this request must not be routed to, such as one that just failed
+	 * to answer it. When every eligible shard is excluded, `route()` returns
+	 * `'no-shards'`. Added in 0.8.0.
+	 */
+	excludeShards?: readonly string[];
 };
 
 export type RouteResult = {
@@ -584,7 +590,10 @@ export const createRouter = (options: RouterOptions): Router => {
 		};
 		if (disposed) return recordRejection('no-shards');
 
-		const live = eligibleShards();
+		const excluded = request.excludeShards ?? [];
+		const live = eligibleShards().filter(
+			(shard) => !excluded.includes(shard.id)
+		);
 		if (live.length === 0) return recordRejection('no-shards');
 		const tenantShards = live.filter(
 			(shard) =>

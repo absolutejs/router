@@ -292,4 +292,280 @@ describe('Bun gateway adapter', () => {
 			await closeServer(upstream);
 		}
 	});
+	/* Behind the PaaS edge an app saw http://10.50.0.4:46048 as its own URL,
+	 * so sign-in return links carried the internal port and were refused as
+	 * cross-origin (Management, 2026-10-20). */
+	test('preserveHost hands the upstream the public host over HTTP and WebSocket', async () => {
+		const seen: string[] = [];
+		const upstream = Bun.serve({
+			fetch: (request, server) => {
+				seen.push(`${request.url} host=${request.headers.get('host')}`);
+				if (server.upgrade(request)) return undefined;
+
+				return new Response('ok');
+			},
+			port: 0,
+			websocket: { message: () => {}, open: (socket) => socket.close() }
+		});
+		const gatewayFor = (preserveHost: boolean) =>
+			createBunGateway({
+				preserveHost,
+				resolve: () => ({ tenantId: 'alpha' }),
+				router: createRouter({
+					perTenantConnectionCap: 4,
+					shards: [
+						{
+							id: 'alpha',
+							tenants: ['alpha'],
+							url: `http://127.0.0.1:${upstream.port}`
+						}
+					]
+				})
+			});
+		const preserving = Bun.serve({ ...gatewayFor(true), port: 0 });
+		const rewriting = Bun.serve({ ...gatewayFor(false), port: 0 });
+
+		try {
+			await fetch(`http://127.0.0.1:${preserving.port}/callback?x=1`, {
+				headers: { host: 'app.example.com' }
+			});
+			const socket = new (WebSocket as unknown as {
+				new (url: string, options?: Bun.WebSocketOptions): WebSocket;
+			})(`ws://127.0.0.1:${preserving.port}/live`, {
+				headers: { host: 'app.example.com' }
+			});
+			await new Promise((resolve) => {
+				socket.addEventListener('close', resolve, { once: true });
+			});
+			await fetch(`http://127.0.0.1:${rewriting.port}/callback`, {
+				headers: { host: 'app.example.com' }
+			});
+
+			expect(seen).toEqual([
+				'http://app.example.com/callback?x=1 host=app.example.com',
+				'http://app.example.com/live host=app.example.com',
+				`http://127.0.0.1:${upstream.port}/callback host=127.0.0.1:${upstream.port}`
+			]);
+		} finally {
+			closeServer(preserving);
+			closeServer(rewriting);
+			closeServer(upstream);
+		}
+	});
+
+	/* A port nothing listens on: connecting is refused, the way a host whose
+	 * workload died answers. */
+	const deadUrl = async () => {
+		const server = Bun.serve({
+			fetch: () => new Response('gone'),
+			port: 0
+		});
+		const url = `http://127.0.0.1:${server.port}`;
+		await closeServer(server);
+
+		return url;
+	};
+
+	const twoShards = (deadShard: string, liveShard: string) => ({
+		balance: 'round-robin' as const,
+		shards: [
+			{ id: 'dead', url: deadShard },
+			{ id: 'live', url: liveShard }
+		]
+	});
+
+	test('a request whose upstream cannot be reached is answered by another shard', async () => {
+		const upstream = Bun.serve({
+			fetch: () => new Response('served'),
+			port: 0
+		});
+		const router = createRouter(
+			twoShards(await deadUrl(), `http://127.0.0.1:${upstream.port}`)
+		);
+		const failures: Array<{ kind: string; shard: string }> = [];
+		const gateway = createBunGateway({
+			onUpstreamFailure: ({ kind, shard }) =>
+				failures.push({ kind, shard: shard.id }),
+			resolve: () => ({ tenantId: 'alpha' }),
+			router
+		});
+		const edge = Bun.serve({ ...gateway, port: 0 });
+
+		try {
+			const statuses = await Promise.all(
+				Array.from({ length: 4 }, async () => {
+					const response = await fetch(
+						`http://127.0.0.1:${edge.port}/`
+					);
+					await response.text();
+
+					return response.status;
+				})
+			);
+			expect(statuses).toEqual([200, 200, 200, 200]);
+			expect(failures.length).toBeGreaterThan(0);
+			expect(
+				failures.every(
+					({ kind, shard }) =>
+						kind === 'unreachable' && shard === 'dead'
+				)
+			).toBeTrue();
+		} finally {
+			await closeServer(edge);
+			await closeServer(upstream);
+		}
+	});
+
+	test('a request that is not safe to repeat is never sent twice', async () => {
+		const router = createRouter({
+			shards: [{ id: 'dead', url: await deadUrl() }]
+		});
+		const gateway = createBunGateway({
+			resolve: () => ({ tenantId: 'alpha' }),
+			router
+		});
+		const edge = Bun.serve({ ...gateway, port: 0 });
+		let posted = 0;
+		const upstream = Bun.serve({
+			fetch: () => {
+				posted += 1;
+
+				return new Response('applied');
+			},
+			port: 0
+		});
+		router.addShard({
+			id: 'live',
+			url: `http://127.0.0.1:${upstream.port}`
+		});
+
+		try {
+			const outcomes = await Promise.all(
+				Array.from({ length: 4 }, async () => {
+					const response = await fetch(
+						`http://127.0.0.1:${edge.port}/orders`,
+						{ body: 'one order', method: 'POST' }
+					);
+					await response.text();
+
+					return response.status;
+				})
+			);
+			// Each POST went to exactly one shard: a dead one fails it.
+			expect(
+				posted + outcomes.filter((status) => status === 502).length
+			).toBe(4);
+			expect(
+				outcomes.every((status) => status === 200 || status === 502)
+			).toBeTrue();
+		} finally {
+			await closeServer(edge);
+			await closeServer(upstream);
+		}
+	});
+
+	test('a slow upstream answers 504 and is not retried', async () => {
+		let asked = 0;
+		const slow = Bun.serve({
+			fetch: async () => {
+				asked += 1;
+				await Bun.sleep(500);
+
+				return new Response('late');
+			},
+			port: 0
+		});
+		const router = createRouter({
+			shards: [
+				{ id: 'slow-a', url: `http://127.0.0.1:${slow.port}` },
+				{ id: 'slow-b', url: `http://127.0.0.1:${slow.port}` }
+			]
+		});
+		const failures: string[] = [];
+		const gateway = createBunGateway({
+			onUpstreamFailure: ({ kind }) => failures.push(kind),
+			resolve: () => ({ tenantId: 'alpha' }),
+			router,
+			upstreamHeadersTimeoutMs: 50
+		});
+		const edge = Bun.serve({ ...gateway, port: 0 });
+
+		try {
+			const response = await fetch(`http://127.0.0.1:${edge.port}/`);
+			expect(response.status).toBe(504);
+			expect(asked).toBe(1);
+			expect(failures).toEqual(['timeout']);
+		} finally {
+			await closeServer(edge);
+			await closeServer(slow);
+		}
+	});
+
+	test('a response slower than the headers deadline to stream still streams', async () => {
+		const upstream = Bun.serve({
+			fetch: () =>
+				new Response(
+					new ReadableStream({
+						start: async (controller) => {
+							controller.enqueue(new TextEncoder().encode('a'));
+							await Bun.sleep(150);
+							controller.enqueue(new TextEncoder().encode('b'));
+							controller.close();
+						}
+					})
+				),
+			port: 0
+		});
+		const router = createRouter({
+			shards: [{ id: 'live', url: `http://127.0.0.1:${upstream.port}` }]
+		});
+		const gateway = createBunGateway({
+			resolve: () => ({ tenantId: 'alpha' }),
+			router,
+			upstreamHeadersTimeoutMs: 50
+		});
+		const edge = Bun.serve({ ...gateway, port: 0 });
+
+		try {
+			const response = await fetch(`http://127.0.0.1:${edge.port}/`);
+			expect(response.status).toBe(200);
+			expect(await response.text()).toBe('ab');
+		} finally {
+			await closeServer(edge);
+			await closeServer(upstream);
+		}
+	});
+
+	test('retries can be turned off', async () => {
+		const upstream = Bun.serve({
+			fetch: () => new Response('served'),
+			port: 0
+		});
+		const router = createRouter(
+			twoShards(await deadUrl(), `http://127.0.0.1:${upstream.port}`)
+		);
+		const gateway = createBunGateway({
+			resolve: () => ({ tenantId: 'alpha' }),
+			retry: false,
+			router
+		});
+		const edge = Bun.serve({ ...gateway, port: 0 });
+
+		try {
+			const statuses = await Promise.all(
+				Array.from({ length: 4 }, async () => {
+					const response = await fetch(
+						`http://127.0.0.1:${edge.port}/`
+					);
+					await response.text();
+
+					return response.status;
+				})
+			);
+			expect(statuses).toContain(502);
+		} finally {
+			await closeServer(edge);
+			await closeServer(upstream);
+		}
+	});
 });

@@ -5,6 +5,40 @@
 		{
 			"changes": [
 				{
+					"kind": "added",
+					"summary": "excludeShards: keep a route request off shards that already failed it",
+					"symbols": [
+						"RouteRequest"
+					]
+				},
+				{
+					"kind": "added",
+					"summary": "The Bun gateway retries a request whose upstream cannot be reached on another shard, reports each failed upstream, and can bound how long an upstream takes to send its headers",
+					"symbols": [
+						"BunGatewayOptions"
+					],
+					"detail": "Only methods safe to repeat (GET, HEAD, OPTIONS) are retried, once by default, on a fresh route that excludes the shards already tried. onUpstreamFailure lets a caller stop routing to a dead shard before its next health check. upstreamHeadersTimeoutMs answers 504 and never retries, so slow work never runs twice."
+				}
+			],
+			"date": "2026-10-29",
+			"version": "0.8.0"
+		},
+		{
+			"changes": [
+				{
+					"kind": "added",
+					"summary": "preserveHost: send the client's Host to the upstream so apps behind the gateway see their public name",
+					"symbols": [
+						"BunGatewayOptions"
+					]
+				}
+			],
+			"date": "2026-10-20",
+			"version": "0.7.0"
+		},
+		{
+			"changes": [
+				{
 					"kind": "fixed",
 					"summary": "Pass compressed responses through the Bun gateway as the app encoded them"
 				}
