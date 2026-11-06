@@ -89,6 +89,20 @@ export type BunGatewayOptions = {
 	 */
 	upstreamHeadersTimeoutMs?: number;
 	/**
+	 * Tell a dead host from a slow one while a request waits. A connection to a
+	 * host that vanished gets no refusal, so `fetch` hangs. After `afterMs` with
+	 * no response headers, and again each `afterMs` while it waits, the gateway
+	 * tries a TCP connection to the upstream. A slow app still accepts one, so
+	 * it is left to answer. If the connection fails, the request stops and counts
+	 * as `unreachable`: reported to `onUpstreamFailure` and retried under `retry`.
+	 * Default: off. Added in 0.9.0.
+	 */
+	upstreamLiveness?: {
+		afterMs: number;
+		/** How long a connection attempt may take. Default 1,500 ms. */
+		connectTimeoutMs?: number;
+	};
+	/**
 	 * Send a request whose upstream could not be reached (refused, reset or
 	 * unroutable before any response) to another shard. Only methods that are
 	 * safe to repeat are retried. Each retry is a fresh `route()` that
@@ -190,28 +204,101 @@ const targetFor = (
 };
 
 class UpstreamHeadersTimeoutError extends Error {}
+class UpstreamDeadError extends Error {}
 
-/** The client's abort, plus a deadline for the response headers alone: once
- *  they arrive the body streams for as long as it takes. */
-const headersDeadline = (request: Request, timeoutMs?: number) => {
-	if (timeoutMs === undefined)
+const DEFAULT_CONNECT_TIMEOUT_MS = 1_500;
+const HTTP_DEFAULT_PORT = 80;
+const HTTPS_DEFAULT_PORT = 443;
+
+/** Whether a TCP connection to the target's host opens in time. */
+export const upstreamAccepts = (target: URL, timeoutMs: number) =>
+	new Promise<boolean>((resolve) => {
+		const timer = setTimeout(() => resolve(false), timeoutMs);
+		const settle = (accepted: boolean) => {
+			clearTimeout(timer);
+			resolve(accepted);
+		};
+		const fallbackPort =
+			target.protocol === 'https:'
+				? HTTPS_DEFAULT_PORT
+				: HTTP_DEFAULT_PORT;
+		Bun.connect({
+			hostname: target.hostname,
+			port: Number(target.port) || fallbackPort,
+			socket: {
+				connectError: () => settle(false),
+				data: () => undefined,
+				error: () => settle(false),
+				open: (socket) => {
+					settle(true);
+					socket.end();
+				}
+			}
+		}).catch(() => settle(false));
+	});
+
+/** The client's abort, a deadline for the response headers alone, and a check
+ *  that a silent upstream is still there: once the headers arrive the body
+ *  streams for as long as it takes. */
+const headersDeadline = (
+	request: Request,
+	target: URL,
+	timeoutMs: number | undefined,
+	liveness: BunGatewayOptions['upstreamLiveness']
+) => {
+	if (timeoutMs === undefined && liveness === undefined)
 		return {
 			clear: () => undefined,
+			dead: () => false,
 			signal: request.signal,
 			timedOut: () => false
 		};
 	const controller = new AbortController();
 	let expired = false;
-	const timer = setTimeout(() => {
-		expired = true;
+	let dead = false;
+	let cleared = false;
+	const timer =
+		timeoutMs === undefined
+			? undefined
+			: setTimeout(() => {
+					expired = true;
+					controller.abort();
+				}, timeoutMs);
+	let livenessTimer: ReturnType<typeof setTimeout> | undefined;
+	const checkLiveness = async () => {
+		if (!liveness) return;
+		const accepted = await upstreamAccepts(
+			target,
+			liveness.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
+		);
+		if (cleared) return;
+		if (accepted) {
+			livenessTimer = setTimeout(
+				() => void checkLiveness(),
+				liveness.afterMs
+			);
+
+			return;
+		}
+		dead = true;
 		controller.abort();
-	}, timeoutMs);
+	};
+	if (liveness)
+		livenessTimer = setTimeout(
+			() => void checkLiveness(),
+			liveness.afterMs
+		);
 	request.signal.addEventListener('abort', () => controller.abort(), {
 		once: true
 	});
 
 	return {
-		clear: () => clearTimeout(timer),
+		clear: () => {
+			cleared = true;
+			clearTimeout(timer);
+			clearTimeout(livenessTimer);
+		},
+		dead: () => dead,
 		signal: controller.signal,
 		timedOut: () => expired
 	};
@@ -222,7 +309,8 @@ const proxyHttp = async (
 	target: URL,
 	clientAddress: SocketAddress | null | undefined,
 	forwarding: Forwarding,
-	headersTimeoutMs?: number
+	headersTimeoutMs?: number,
+	liveness?: BunGatewayOptions['upstreamLiveness']
 ) => {
 	const method = request.method.toUpperCase();
 	const headers = forwardedHeaders(request, clientAddress, forwarding);
@@ -233,7 +321,12 @@ const proxyHttp = async (
 	// app encoded it, for exactly what the client accepts.
 	if (!headers.has('accept-encoding'))
 		headers.set('accept-encoding', 'identity');
-	const deadline = headersDeadline(request, headersTimeoutMs);
+	const deadline = headersDeadline(
+		request,
+		target,
+		headersTimeoutMs,
+		liveness
+	);
 	const upstream = await fetch(target, {
 		body: method === 'GET' || method === 'HEAD' ? undefined : request.body,
 		decompress: false,
@@ -243,6 +336,10 @@ const proxyHttp = async (
 		signal: deadline.signal
 	})
 		.catch((error: unknown) => {
+			if (deadline.dead())
+				throw new UpstreamDeadError(
+					`Upstream ${target.host} stopped accepting connections`
+				);
 			if (deadline.timedOut())
 				throw new UpstreamHeadersTimeoutError(
 					`Upstream sent no response headers within ${headersTimeoutMs}ms`
@@ -420,7 +517,8 @@ export const createBunGateway = (options: BunGatewayOptions) => {
 				targetFor(shard, request, options.target),
 				clientAddress,
 				options,
-				options.upstreamHeadersTimeoutMs
+				options.upstreamHeadersTimeoutMs,
+				options.upstreamLiveness
 			);
 		} catch (error) {
 			failure = error;

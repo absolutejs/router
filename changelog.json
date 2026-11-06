@@ -6,6 +6,20 @@
 			"changes": [
 				{
 					"kind": "added",
+					"summary": "upstreamLiveness: tell a dead host from a slow one while a request waits",
+					"symbols": [
+						"BunGatewayOptions"
+					],
+					"detail": "A connection to a host that vanished gets no refusal, so fetch hangs. After afterMs with no response headers, the gateway tries a TCP connection to the upstream. A slow app still accepts one and is left to answer. A failed connection stops the request as unreachable, so onUpstreamFailure and retry apply within seconds."
+				}
+			],
+			"date": "2026-11-06",
+			"version": "0.9.0"
+		},
+		{
+			"changes": [
+				{
+					"kind": "added",
 					"summary": "excludeShards: keep a route request off shards that already failed it",
 					"symbols": [
 						"RouteRequest"

@@ -416,6 +416,93 @@ describe('Bun gateway adapter', () => {
 		}
 	});
 
+	test('a host that stops accepting connections mid-request is retried elsewhere', async () => {
+		const seen: { release?: () => void } = {};
+		const vanishing = Bun.serve({
+			fetch: () =>
+				new Promise<Response>((resolve) => {
+					seen.release = () => resolve(new Response('late'));
+					// Stops listening, and the request stays unanswered.
+					void vanishing.stop();
+				}),
+			port: 0
+		});
+		const live = Bun.serve({
+			fetch: () => new Response('from the other copy'),
+			port: 0
+		});
+		const router = createRouter({
+			balance: 'round-robin',
+			shards: [
+				{ id: 'vanishing', url: `http://127.0.0.1:${vanishing.port}` },
+				{ id: 'live', url: `http://127.0.0.1:${live.port}` }
+			]
+		});
+		const failures: Array<{ kind: string; shard: string }> = [];
+		const gateway = createBunGateway({
+			onUpstreamFailure: ({ kind, shard }) =>
+				failures.push({ kind, shard: shard.id }),
+			resolve: () => ({ tenantId: 'alpha' }),
+			router,
+			upstreamLiveness: { afterMs: 100 }
+		});
+		const edge = Bun.serve({ ...gateway, port: 0 });
+
+		try {
+			const responses = await Promise.all(
+				[1, 2].map(async () => {
+					const response = await fetch(
+						`http://127.0.0.1:${edge.port}/`
+					);
+
+					return `${response.status} ${await response.text()}`;
+				})
+			);
+			expect(responses).toEqual([
+				'200 from the other copy',
+				'200 from the other copy'
+			]);
+			expect(failures).toEqual([
+				{ kind: 'unreachable', shard: 'vanishing' }
+			]);
+		} finally {
+			seen.release?.();
+			await closeServer(edge);
+			await closeServer(live);
+			await closeServer(vanishing);
+		}
+	});
+
+	test('a slow upstream that still accepts connections is left to answer', async () => {
+		const slow = Bun.serve({
+			fetch: async () => {
+				await Bun.sleep(400);
+
+				return new Response('slow but fine');
+			},
+			port: 0
+		});
+		const failures: string[] = [];
+		const gateway = createBunGateway({
+			onUpstreamFailure: ({ kind }) => failures.push(kind),
+			resolve: () => ({ tenantId: 'alpha' }),
+			router: createRouter({
+				shards: [{ id: 'slow', url: `http://127.0.0.1:${slow.port}` }]
+			}),
+			upstreamLiveness: { afterMs: 100 }
+		});
+		const edge = Bun.serve({ ...gateway, port: 0 });
+
+		try {
+			const response = await fetch(`http://127.0.0.1:${edge.port}/`);
+			expect(await response.text()).toBe('slow but fine');
+			expect(failures).toEqual([]);
+		} finally {
+			await closeServer(edge);
+			await closeServer(slow);
+		}
+	});
+
 	test('a request that is not safe to repeat is never sent twice', async () => {
 		const router = createRouter({
 			shards: [{ id: 'dead', url: await deadUrl() }]
