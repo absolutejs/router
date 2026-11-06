@@ -293,3 +293,9 @@ health check. `upstreamHeadersTimeoutMs` bounds how long an upstream may take
 to send its response headers (the body then streams for as long as it needs).
 A request that runs out of time answers 504 and is never retried, so slow work
 never runs twice.
+
+`upstreamLiveness` tells a dead host from a slow one. A connection to a host that
+vanished gets no refusal, so a request would hang. After `afterMs` with no
+response headers, the gateway tries a TCP connection to the upstream: a slow app
+still accepts one and is left to answer, and a failed connection stops the
+request as unreachable, so `onUpstreamFailure` and `retry` apply within seconds.
