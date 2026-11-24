@@ -5,12 +5,27 @@
 		{
 			"changes": [
 				{
+					"detail": "`perTenantConnectionCap` also takes a function of the tenant id, read on every `route()`, so one router can give a dev-mode site that loads dozens of modules at once a higher cap than an app that should never hold more than a few. A number works as before.",
+					"kind": "added",
+					"summary": "A connection cap per tenant",
+					"symbols": [
+						"createRouter",
+						"RouterOptions"
+					]
+				}
+			],
+			"date": "2026-11-24",
+			"version": "0.10.0"
+		},
+		{
+			"changes": [
+				{
+					"detail": "A connection to a host that vanished gets no refusal, so fetch hangs. After afterMs with no response headers, the gateway tries a TCP connection to the upstream. A slow app still accepts one and is left to answer. A failed connection stops the request as unreachable, so onUpstreamFailure and retry apply within seconds.",
 					"kind": "added",
 					"summary": "upstreamLiveness: tell a dead host from a slow one while a request waits",
 					"symbols": [
 						"BunGatewayOptions"
-					],
-					"detail": "A connection to a host that vanished gets no refusal, so fetch hangs. After afterMs with no response headers, the gateway tries a TCP connection to the upstream. A slow app still accepts one and is left to answer. A failed connection stops the request as unreachable, so onUpstreamFailure and retry apply within seconds."
+					]
 				}
 			],
 			"date": "2026-11-06",
@@ -26,12 +41,12 @@
 					]
 				},
 				{
+					"detail": "Only methods safe to repeat (GET, HEAD, OPTIONS) are retried, once by default, on a fresh route that excludes the shards already tried. onUpstreamFailure lets a caller stop routing to a dead shard before its next health check. upstreamHeadersTimeoutMs answers 504 and never retries, so slow work never runs twice.",
 					"kind": "added",
 					"summary": "The Bun gateway retries a request whose upstream cannot be reached on another shard, reports each failed upstream, and can bound how long an upstream takes to send its headers",
 					"symbols": [
 						"BunGatewayOptions"
-					],
-					"detail": "Only methods safe to repeat (GET, HEAD, OPTIONS) are retried, once by default, on a fresh route that excludes the shards already tried. onUpstreamFailure lets a caller stop routing to a dead shard before its next health check. upstreamHeadersTimeoutMs answers 504 and never retries, so slow work never runs twice."
+					]
 				}
 			],
 			"date": "2026-10-29",

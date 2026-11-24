@@ -221,6 +221,25 @@ describe('createRouter', () => {
 		expect(router.route({ tenantId: 'acme' }).decision).toBe('allow');
 	});
 
+	test('a cap function gives each tenant its own connection cap', () => {
+		const router = createRouter({
+			perTenantConnectionCap: (tenantId) =>
+				tenantId.startsWith('preview:') ? 3 : 1,
+			shards: makeShards(2)
+		});
+		router.acquire('acme');
+		expect(router.route({ tenantId: 'acme' }).decision).toBe('capped');
+		router.acquire('preview:acme');
+		router.acquire('preview:acme');
+		expect(router.route({ tenantId: 'preview:acme' }).decision).toBe(
+			'allow'
+		);
+		router.acquire('preview:acme');
+		expect(router.route({ tenantId: 'preview:acme' }).decision).toBe(
+			'capped'
+		);
+	});
+
 	test('release is idempotent', () => {
 		const router = createRouter({
 			perTenantConnectionCap: 1,

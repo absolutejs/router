@@ -134,9 +134,11 @@ export type RouterOptions = {
 	/**
 	 * Max concurrent connections per tenant (counted via `acquire()` /
 	 * `release()`). Default `Infinity` (no cap). When reached, `route()`
-	 * returns `'capped'`.
+	 * returns `'capped'`. A function gives each tenant its own cap (a
+	 * dev-mode site that loads dozens of modules at once next to an app that
+	 * should never hold more than a few), read on every `route()`.
 	 */
-	perTenantConnectionCap?: number;
+	perTenantConnectionCap?: number | ((tenantId: string) => number);
 	/**
 	 * Per-tenant token bucket. Default `{ tokens: Infinity, refillPerSecond: 0 }`
 	 * (no limit). When the tenant's bucket is empty, `route()` returns
@@ -420,7 +422,11 @@ export const createRouter = (options: RouterOptions): Router => {
 		options.load
 	);
 	const defaultBalance: BalanceStrategy = options.balance ?? 'sticky';
-	const cap = options.perTenantConnectionCap ?? Infinity;
+	const configuredCap = options.perTenantConnectionCap ?? Infinity;
+	const capFor = (tenantId: string) =>
+		typeof configuredCap === 'function'
+			? configuredCap(tenantId)
+			: configuredCap;
 	const rate = options.perTenantRateLimit ?? {
 		refillPerSecond: 0,
 		tokens: Infinity
@@ -624,7 +630,7 @@ export const createRouter = (options: RouterOptions): Router => {
 		const now = routeStart;
 		const state = ensureTenant(request.tenantId, now);
 
-		if (state.active >= cap) {
+		if (state.active >= capFor(request.tenantId)) {
 			return recordRejection('capped');
 		}
 
